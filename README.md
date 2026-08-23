@@ -1,6 +1,11 @@
 # redatom
 
-Rust MCP server that reads Reddit through public Atom/RSS (`.rss`) only. No OAuth, no PRAW, no HTML scrape, no `.json` API.
+Rust MCP server that reads Reddit via public Atom/RSS (`.rss`) endpoints only. No OAuth, no PRAW, no HTML scraping, no `.json` API.
+
+<p align="center">
+  <a href="https://github.com/AdrianBinDC/redatom/actions/workflows/ci.yml"><img src="https://github.com/AdrianBinDC/redatom/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
+</p>
 
 It returns titles, excerpts, and permalinks. It does not rank, summarize, or score. RSS is flat (~25 items, no comment trees). Fetches happen only when a tool is called.
 
