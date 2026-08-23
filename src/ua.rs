@@ -42,4 +42,39 @@ impl Ua {
             _ => Ua::Honest,
         }
     }
+
+    /// Return one distinct fallback UA identity, or `None` if this is
+    /// already the last fallback to try.
+    pub fn fallback(&self) -> Option<Ua> {
+        match self {
+            Ua::Honest => Some(Ua::Reader),
+            Ua::Reader => Some(Ua::Firefox),
+            Ua::Firefox | Ua::Custom(_) => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn honest_falls_back_to_reader() {
+        assert_eq!(Ua::Honest.fallback(), Some(Ua::Reader));
+    }
+
+    #[test]
+    fn reader_falls_back_to_firefox() {
+        assert_eq!(Ua::Reader.fallback(), Some(Ua::Firefox));
+    }
+
+    #[test]
+    fn firefox_has_no_fallback() {
+        assert_eq!(Ua::Firefox.fallback(), None);
+    }
+
+    #[test]
+    fn custom_has_no_fallback() {
+        assert_eq!(Ua::Custom("my-ua/1.0".into()).fallback(), None);
+    }
 }

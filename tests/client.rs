@@ -95,6 +95,20 @@ struct TestHandle {
 }
 
 fn make_client(interval_ms: u64, cache_cap: usize, responses: Vec<FetchResponse>) -> TestHandle {
+    make_client_with_ua(
+        interval_ms,
+        cache_cap,
+        responses,
+        reddit_rss_mcp::ua::Ua::Honest,
+    )
+}
+
+fn make_client_with_ua(
+    interval_ms: u64,
+    cache_cap: usize,
+    responses: Vec<FetchResponse>,
+    ua: reddit_rss_mcp::ua::Ua,
+) -> TestHandle {
     let counter = Arc::new(AtomicUsize::new(0));
     let timestamps = Arc::new(Mutex::new(Vec::new()));
     let inm_log = Arc::new(Mutex::new(Vec::new()));
@@ -104,7 +118,7 @@ fn make_client(interval_ms: u64, cache_cap: usize, responses: Vec<FetchResponse>
         Arc::downgrade(&timestamps),
         Arc::downgrade(&inm_log),
     );
-    let client = RedatomClient::with_wait(Arc::new(fake), interval_ms, cache_cap, 30);
+    let client = RedatomClient::with_ua_and_wait(Arc::new(fake), interval_ms, cache_cap, 30, ua);
     TestHandle {
         client,
         counter,
@@ -155,21 +169,32 @@ async fn comments_atom_has_post_and_comments() {
     assert!(res.source.ends_with(".rss"));
 }
 
-// 3. HTML 403 -> Blocked, not posts: [].
+// 3. HTML 403 -> fallback 403 -> Blocked, not posts: [].
 #[tokio::test]
 async fn html_403_is_blocked() {
     let waf = std::fs::read_to_string("tests/fixtures/waf.html").unwrap();
+    let waf_bytes = waf.as_bytes().to_vec();
     let h = make_client(
         1,
         8,
-        vec![FetchResponse {
-            status: 403,
-            content_type: "text/html; charset=utf-8".into(),
-            body: waf.as_bytes().to_vec(),
-            etag: None,
-            last_modified: None,
-            retry_after: None,
-        }],
+        vec![
+            FetchResponse {
+                status: 403,
+                content_type: "text/html; charset=utf-8".into(),
+                body: waf_bytes.clone(),
+                etag: None,
+                last_modified: None,
+                retry_after: None,
+            },
+            FetchResponse {
+                status: 403,
+                content_type: "text/html; charset=utf-8".into(),
+                body: waf_bytes,
+                etag: None,
+                last_modified: None,
+                retry_after: None,
+            },
+        ],
     );
     let err = h
         .client
@@ -177,6 +202,7 @@ async fn html_403_is_blocked() {
         .await
         .unwrap_err();
     assert!(matches!(err, FetchError::Blocked));
+    assert_eq!(h.counter.load(Ordering::SeqCst), 2);
 }
 
 // 3b. 200 WAF/HTML body -> Blocked, not Ok with count 0.
@@ -201,6 +227,72 @@ async fn waf_200_html_is_blocked() {
         .await
         .unwrap_err();
     assert!(matches!(err, FetchError::Blocked));
+}
+
+// 3c. 403 then 200 Atom with fallback UA -> Ok, exactly 2 GETs.
+#[tokio::test]
+async fn http_403_then_fallback_ua_succeeds() {
+    let waf = std::fs::read_to_string("tests/fixtures/waf.html").unwrap();
+    let atom = std::fs::read_to_string("tests/fixtures/subreddit.atom").unwrap();
+    let h = make_client_with_ua(
+        1,
+        8,
+        vec![
+            FetchResponse {
+                status: 403,
+                content_type: "text/html; charset=utf-8".into(),
+                body: waf.as_bytes().to_vec(),
+                etag: None,
+                last_modified: None,
+                retry_after: None,
+            },
+            FakeHttp::atom(&atom),
+        ],
+        reddit_rss_mcp::ua::Ua::Honest,
+    );
+    let res = h
+        .client
+        .browse_subreddit("LocalLLaMA", "hot", None, 25)
+        .await
+        .expect("fallback UA should succeed");
+    assert_eq!(res.count, 3);
+    assert_eq!(h.counter.load(Ordering::SeqCst), 2);
+}
+
+// 3d. 403 then 403 again -> Blocked, exactly 2 GETs.
+#[tokio::test]
+async fn http_403_twice_is_blocked() {
+    let waf = std::fs::read_to_string("tests/fixtures/waf.html").unwrap();
+    let h = make_client_with_ua(
+        1,
+        8,
+        vec![
+            FetchResponse {
+                status: 403,
+                content_type: "text/html; charset=utf-8".into(),
+                body: waf.as_bytes().to_vec(),
+                etag: None,
+                last_modified: None,
+                retry_after: None,
+            },
+            FetchResponse {
+                status: 403,
+                content_type: "text/html; charset=utf-8".into(),
+                body: waf.as_bytes().to_vec(),
+                etag: None,
+                last_modified: None,
+                retry_after: None,
+            },
+        ],
+        reddit_rss_mcp::ua::Ua::Honest,
+    );
+    let err = h
+        .client
+        .browse_subreddit("LocalLLaMA", "hot", None, 25)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, FetchError::Blocked));
+    assert_eq!(h.counter.load(Ordering::SeqCst), 2);
 }
 
 // 4. Non-allowlisted host -> ForbiddenHost.
