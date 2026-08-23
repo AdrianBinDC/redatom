@@ -18,6 +18,7 @@ use reqwest::header::{
     ACCEPT, ETAG, HeaderMap, HeaderValue, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED,
     USER_AGENT,
 };
+use reqwest::redirect::Policy;
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info, instrument};
 use url::Url;
@@ -75,6 +76,15 @@ impl ReqwestAdapter {
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(total_timeout))
+            .redirect(Policy::custom(|attempt| {
+                let host = attempt.url().host_str().unwrap_or_default();
+                if host_allowed(host) {
+                    attempt.follow()
+                } else {
+                    error!(host, "redirect to disallowed host; stopping");
+                    attempt.stop()
+                }
+            }))
             .build()
             .expect("reqwest client builds");
         Self { client, ua }
@@ -100,6 +110,12 @@ impl FeedHttp for ReqwestAdapter {
                 .send()
                 .await
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            // Belt-and-suspenders: even with the redirect policy above,
+            // verify the final URL host is still in the allowlist.
+            let final_host = resp.url().host_str().unwrap_or_default();
+            if !host_allowed(final_host) {
+                return Err(FetchError::ForbiddenHost(final_host.to_string()).into());
+            }
             let status = resp.status().as_u16();
             let headers = resp.headers();
             let content_type = headers
@@ -499,10 +515,7 @@ impl RedatomClient {
         let normalized = normalize_comments_url(url)?;
         let parsed =
             Url::parse(&normalized).map_err(|_| FetchError::InvalidUrl(url.to_string()))?;
-        let host = parsed.host_str().unwrap_or_default().to_string();
-        if !ALLOWED_HOSTS.contains(&host.as_str()) {
-            return Err(FetchError::ForbiddenHost(host));
-        }
+        reject_if_forbidden(&parsed)?;
 
         let limit = limit.clamp(1, 25);
         let feed = self.fetch_feed(&normalized).await?;
@@ -529,6 +542,20 @@ fn map_http_error(e: Box<dyn std::error::Error + Send + Sync>) -> FetchError {
     }
     error!(%e, "network error");
     FetchError::Network(e.to_string())
+}
+
+/// Returns true if `host` is in the Reddit allowlist.
+pub fn host_allowed(host: &str) -> bool {
+    ALLOWED_HOSTS.contains(&host)
+}
+
+/// Reject a URL whose host is not in the Reddit allowlist.
+pub fn reject_if_forbidden(url: &Url) -> Result<(), FetchError> {
+    let host = url.host_str().unwrap_or_default();
+    if !host_allowed(host) {
+        return Err(FetchError::ForbiddenHost(host.to_string()));
+    }
+    Ok(())
 }
 
 /// Strip `r/`/leading slash; allow only `[A-Za-z0-9_+]`.
@@ -807,6 +834,28 @@ mod tests {
             html_to_excerpt("<div class=\"md\"><p>Hi &amp; hello</p></div>"),
             "Hi & hello"
         );
+    }
+
+    #[test]
+    fn host_allowed_accepts_reddit_hosts() {
+        assert!(host_allowed("www.reddit.com"));
+        assert!(host_allowed("reddit.com"));
+        assert!(host_allowed("old.reddit.com"));
+        assert!(host_allowed("np.reddit.com"));
+        assert!(!host_allowed("evil.example.com"));
+        assert!(!host_allowed("169.254.169.254"));
+        assert!(!host_allowed(""));
+    }
+
+    #[test]
+    fn reject_if_forbidden_blocks_offlist_urls() {
+        let ok = Url::parse("https://www.reddit.com/r/foo/comments/abc/rss").unwrap();
+        assert!(reject_if_forbidden(&ok).is_ok());
+        let bad = Url::parse("https://169.254.169.254/steal").unwrap();
+        assert!(matches!(
+            reject_if_forbidden(&bad),
+            Err(FetchError::ForbiddenHost(_))
+        ));
     }
 
     #[test]
