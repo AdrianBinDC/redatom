@@ -46,4 +46,10 @@ jobs:
 
       - name: cargo test
         if: steps.crate.outputs.present == 'true'
-        run: cargo test
+        run: cargo test --all-targets --locked
+
+      - name: cargo doc
+        if: steps.crate.outputs.present == 'true'
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps --document-private-items

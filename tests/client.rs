@@ -1,5 +1,10 @@
 //! Integration tests for `reddit_rss_mcp::client`. No live Reddit: all
 //! responses come from a fake in-memory `FeedHttp` backend.
+#![allow(
+    missing_docs,
+    clippy::missing_docs_in_private_items,
+    clippy::missing_errors_doc
+)]
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
