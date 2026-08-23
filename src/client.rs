@@ -8,7 +8,7 @@ use std::future::Future;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use feed_rs::model::{Entry, Feed, FeedType};
 use governor::clock::Clock as _;
@@ -54,7 +54,7 @@ pub trait FeedHttp: Send + Sync + 'static {
 }
 
 /// Response metadata + body for one fetched URL.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct FetchResponse {
     /// HTTP status code.
     pub status: u16,
@@ -68,6 +68,55 @@ pub struct FetchResponse {
     pub last_modified: Option<String>,
     /// `Retry-After` header value (seconds), when present.
     pub retry_after: Option<u64>,
+    /// `x-ratelimit-remaining` when present.
+    pub ratelimit_remaining: Option<f64>,
+    /// `x-ratelimit-reset` normalized to seconds from now, when present.
+    pub ratelimit_reset_secs: Option<u64>,
+}
+
+impl FetchResponse {
+    /// Positive wait hint: `Retry-After` if &gt; 0, else `x-ratelimit-reset` if &gt; 0.
+    pub fn wait_hint(&self) -> Option<u64> {
+        self.retry_after
+            .filter(|&s| s > 0)
+            .or_else(|| self.ratelimit_reset_secs.filter(|&s| s > 0))
+    }
+
+    /// Seconds to sleep before one 429 retry. `Retry-After: 0` means retry now;
+    /// a zero `x-ratelimit-reset` is ignored (not a useful backoff).
+    fn retry_wait_secs(&self) -> Option<u64> {
+        self.retry_after
+            .filter(|&s| s > 0)
+            .or(self.ratelimit_reset_secs.filter(|&s| s > 0))
+            .or(self.retry_after)
+    }
+}
+
+/// Parse `Retry-After` as delay-seconds.
+fn parse_retry_after_secs(raw: &str) -> Option<u64> {
+    raw.trim().parse().ok()
+}
+
+/// Parse `x-ratelimit-reset`: small numbers are seconds-from-now; large
+/// values are Unix timestamps.
+fn parse_ratelimit_reset_secs(raw: &str) -> Option<u64> {
+    let n: f64 = raw.trim().parse().ok()?;
+    if !n.is_finite() || n < 0.0 {
+        return None;
+    }
+    if n >= 1_000_000_000.0 {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()?
+            .as_secs_f64();
+        let delta = n - now;
+        if delta <= 0.0 {
+            return None;
+        }
+        return Some(delta.ceil() as u64);
+    }
+    let secs = n.ceil() as u64;
+    if secs == 0 { None } else { Some(secs) }
 }
 
 /// Boxed async future used by [`FeedHttp::get`].
@@ -151,7 +200,15 @@ impl FeedHttp for ReqwestAdapter {
             let retry_after = headers
                 .get(reqwest::header::RETRY_AFTER)
                 .and_then(|v| v.to_str().ok())
+                .and_then(parse_retry_after_secs);
+            let ratelimit_remaining = headers
+                .get("x-ratelimit-remaining")
+                .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.parse().ok());
+            let ratelimit_reset_secs = headers
+                .get("x-ratelimit-reset")
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_ratelimit_reset_secs);
             let body = resp
                 .bytes()
                 .await
@@ -164,6 +221,8 @@ impl FeedHttp for ReqwestAdapter {
                 etag,
                 last_modified,
                 retry_after,
+                ratelimit_remaining,
+                ratelimit_reset_secs,
             })
         })
     }
@@ -195,8 +254,14 @@ pub struct RedatomClient {
     ua: Ua,
     /// Max seconds to wait for a limiter permit.
     limiter_wait_secs: u64,
+    /// Max seconds to wait out Reddit `remaining=0` reset. Separate from
+    /// [`Self::limiter_wait_secs`]: RSS windows are often ~60s, longer than
+    /// the governor budget.
+    quota_wait_secs: u64,
     /// Whether the one-time UA fallback has already been used.
     ua_fallback_used: std::sync::atomic::AtomicBool,
+    /// Earliest time a Reddit GET is allowed after `x-ratelimit-remaining` hit 0.
+    quota_hold_until: Mutex<Option<Instant>>,
 }
 
 impl RedatomClient {
@@ -231,6 +296,19 @@ impl RedatomClient {
         limiter_wait_secs: u64,
         ua: Ua,
     ) -> Self {
+        Self::with_budgets(http, min_interval_ms, cache_cap, limiter_wait_secs, 90, ua)
+    }
+
+    /// Explicit governor wait and Reddit quota-hold wait. Exposed for tests
+    /// and for [`crate::mcp`] env wiring.
+    pub fn with_budgets(
+        http: Arc<dyn FeedHttp>,
+        min_interval_ms: u64,
+        cache_cap: usize,
+        limiter_wait_secs: u64,
+        quota_wait_secs: u64,
+        ua: Ua,
+    ) -> Self {
         let period = Duration::from_millis(min_interval_ms.max(1));
         let quota = Quota::with_period(period)
             .expect("period > 0")
@@ -244,18 +322,47 @@ impl RedatomClient {
             cache: Mutex::new(LruCache::new(cap)),
             ua,
             limiter_wait_secs,
+            quota_wait_secs,
             ua_fallback_used: std::sync::atomic::AtomicBool::new(false),
+            quota_hold_until: Mutex::new(None),
         }
     }
 
     /// Wait until the rate limiter grants a permit, or fail.
     ///
+    /// Also waits out Reddit's `x-ratelimit-reset` hold when the last response
+    /// reported no remaining quota, if that hold fits in [`Self::quota_wait_secs`].
+    /// The governor deadline starts after that sleep so a ~60s RSS window is
+    /// not compared against the 30s limiter budget.
+    ///
     /// # Errors
     ///
-    /// Returns [`FetchError::RateLimited`] if no permit is granted within `wait_secs`.
+    /// Returns [`FetchError::RateLimited`] if no permit is granted within `wait_secs`,
+    /// or if Reddit's quota hold lasts longer than [`Self::quota_wait_secs`].
     async fn acquire_permit(&self, wait_secs: u64) -> Result<(), FetchError> {
-        let start = std::time::Instant::now();
+        if let Some(until) = self.quota_hold_until.lock().ok().and_then(|g| *g) {
+            let now = Instant::now();
+            if until > now {
+                let remain = until.saturating_duration_since(now);
+                let remain_secs = remain.as_secs().max(1);
+                if remain_secs > self.quota_wait_secs {
+                    error!(
+                        retry_after_secs = remain_secs,
+                        quota_wait_secs = self.quota_wait_secs,
+                        "Reddit quota hold exceeds quota wait budget"
+                    );
+                    return Err(FetchError::RateLimited {
+                        retry_after_secs: Some(remain_secs),
+                    });
+                }
+                debug!(wait_secs = remain_secs, "waiting for Reddit quota reset");
+                tokio::time::sleep(remain).await;
+            }
+        }
+
+        let start = Instant::now();
         let deadline = start + Duration::from_secs(wait_secs);
+
         loop {
             match self.limiter.check() {
                 Ok(_) => {
@@ -266,15 +373,38 @@ impl RedatomClient {
                     return Ok(());
                 }
                 Err(next) => {
-                    if start.elapsed() >= Duration::from_secs(wait_secs) {
+                    if Instant::now() >= deadline {
                         error!("no limiter permit within {wait_secs}s; giving up");
-                        return Err(FetchError::RateLimited);
+                        return Err(FetchError::RateLimited {
+                            retry_after_secs: None,
+                        });
                     }
                     let clock = QuantaClock::default();
-                    let wait = next.wait_time_from(clock.now()).min(deadline - start);
+                    let wait = next
+                        .wait_time_from(clock.now())
+                        .min(deadline.saturating_duration_since(Instant::now()));
                     tokio::time::sleep(wait.max(Duration::from_millis(1))).await;
                 }
             }
+        }
+    }
+
+    /// Record Reddit quota headers so the next GET can wait for reset.
+    fn note_ratelimit(&self, resp: &FetchResponse) {
+        let Some(remaining) = resp.ratelimit_remaining else {
+            return;
+        };
+        let Ok(mut hold) = self.quota_hold_until.lock() else {
+            return;
+        };
+        if remaining < 1.0 {
+            if let Some(secs) = resp.ratelimit_reset_secs.filter(|&s| s > 0) {
+                let capped = secs.min(300);
+                *hold = Some(Instant::now() + Duration::from_secs(capped));
+                debug!(remaining, reset_secs = capped, "recorded Reddit quota hold");
+            }
+        } else {
+            *hold = None;
         }
     }
 
@@ -370,12 +500,23 @@ impl RedatomClient {
         let headers = self.make_headers(url);
         let resp = self.http.get(url, &headers).await.map_err(map_http_error)?;
         drop(_in_flight);
+        self.note_ratelimit(&resp);
 
         if resp.status == 429 {
-            if let Some(wait) = resp.retry_after {
+            if let Some(wait) = resp.retry_wait_secs() {
+                // Don't block the caller for the entire limiter budget on a 429.
+                if wait > 0 && wait >= self.limiter_wait_secs {
+                    info!(
+                        retry_after_secs = wait,
+                        "HTTP 429 wait exceeds limiter budget; not retrying"
+                    );
+                    return Err(FetchError::RateLimited {
+                        retry_after_secs: resp.wait_hint().or(Some(wait)),
+                    });
+                }
                 let capped = wait.min(60);
                 if capped > 0 {
-                    info!(wait_secs = capped, "honoring Retry-After once");
+                    info!(wait_secs = capped, "honoring Reddit wait hint once");
                     tokio::time::sleep(Duration::from_secs(capped)).await;
                 }
                 let _in_flight2 = self
@@ -392,12 +533,22 @@ impl RedatomClient {
                     .await
                     .map_err(map_http_error)?;
                 drop(_in_flight2);
+                self.note_ratelimit(&resp2);
                 if resp2.status != 429 {
                     return self.finish_fetch(url, resp2).await;
                 }
+                error!("HTTP 429 from reddit after one wait");
+                return Err(FetchError::RateLimited {
+                    retry_after_secs: resp2
+                        .wait_hint()
+                        .or(resp.wait_hint())
+                        .or(Some(wait).filter(|&s| s > 0)),
+                });
             }
             error!("HTTP 429 from reddit");
-            return Err(FetchError::RateLimited);
+            return Err(FetchError::RateLimited {
+                retry_after_secs: resp.wait_hint(),
+            });
         }
 
         self.finish_fetch(url, resp).await
@@ -489,6 +640,7 @@ impl RedatomClient {
         let resp = self.http.get(url, &headers).await.map_err(map_http_error)?;
 
         drop(_in_flight);
+        self.note_ratelimit(&resp);
 
         if resp.status == 403 {
             error!("fallback UA also returned 403; returning Blocked");
@@ -960,6 +1112,35 @@ mod tests {
         let err: Box<dyn std::error::Error + Send + Sync> =
             Box::new(std::io::Error::other("connection refused"));
         assert!(matches!(map_http_error(err), FetchError::Network(_)));
+    }
+
+    #[test]
+    fn parse_ratelimit_reset_secs_from_delta() {
+        assert_eq!(parse_ratelimit_reset_secs("48"), Some(48));
+        assert_eq!(parse_ratelimit_reset_secs("0.0"), None);
+        assert_eq!(parse_retry_after_secs("12"), Some(12));
+    }
+
+    #[test]
+    fn wait_hint_prefers_retry_after() {
+        let resp = FetchResponse {
+            retry_after: Some(3),
+            ratelimit_reset_secs: Some(48),
+            ..Default::default()
+        };
+        assert_eq!(resp.wait_hint(), Some(3));
+        let resp = FetchResponse {
+            ratelimit_reset_secs: Some(48),
+            ..Default::default()
+        };
+        assert_eq!(resp.wait_hint(), Some(48));
+        let zero_retry = FetchResponse {
+            retry_after: Some(0),
+            ratelimit_reset_secs: Some(48),
+            ..Default::default()
+        };
+        assert_eq!(zero_retry.wait_hint(), Some(48));
+        assert_eq!(zero_retry.retry_wait_secs(), Some(48));
     }
 
     #[test]

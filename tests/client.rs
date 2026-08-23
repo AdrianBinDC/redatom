@@ -50,7 +50,7 @@ impl FakeHttp {
             body: body.as_bytes().to_vec(),
             etag: Some("\"v1\"".into()),
             last_modified: Some("Wed, 22 Aug 2026 12:00:00 GMT".into()),
-            retry_after: None,
+            ..Default::default()
         }
     }
 }
@@ -190,6 +190,8 @@ async fn html_403_is_blocked() {
                 etag: None,
                 last_modified: None,
                 retry_after: None,
+                ratelimit_remaining: None,
+                ratelimit_reset_secs: None,
             },
             FetchResponse {
                 status: 403,
@@ -198,6 +200,8 @@ async fn html_403_is_blocked() {
                 etag: None,
                 last_modified: None,
                 retry_after: None,
+                ratelimit_remaining: None,
+                ratelimit_reset_secs: None,
             },
         ],
     );
@@ -224,6 +228,8 @@ async fn waf_200_html_is_blocked() {
             etag: None,
             last_modified: None,
             retry_after: None,
+            ratelimit_remaining: None,
+            ratelimit_reset_secs: None,
         }],
     );
     let err = h
@@ -250,6 +256,8 @@ async fn http_403_then_fallback_ua_succeeds() {
                 etag: None,
                 last_modified: None,
                 retry_after: None,
+                ratelimit_remaining: None,
+                ratelimit_reset_secs: None,
             },
             FakeHttp::atom(&atom),
         ],
@@ -279,6 +287,8 @@ async fn http_403_twice_is_blocked() {
                 etag: None,
                 last_modified: None,
                 retry_after: None,
+                ratelimit_remaining: None,
+                ratelimit_reset_secs: None,
             },
             FetchResponse {
                 status: 403,
@@ -287,6 +297,8 @@ async fn http_403_twice_is_blocked() {
                 etag: None,
                 last_modified: None,
                 retry_after: None,
+                ratelimit_remaining: None,
+                ratelimit_reset_secs: None,
             },
         ],
         reddit_rss_mcp::ua::Ua::Honest,
@@ -393,6 +405,8 @@ async fn etag_304_serves_cache() {
             etag: Some("\"v1\"".into()),
             last_modified: None,
             retry_after: None,
+            ratelimit_remaining: None,
+            ratelimit_reset_secs: None,
         },
     ];
     let h = make_client(1, 8, responses);
@@ -544,7 +558,7 @@ async fn limiter_wait_zero_returns_rate_limited() {
         .browse_subreddit("LocalLLaMA", "hot", None, 25)
         .await
         .unwrap_err();
-    assert!(matches!(err, FetchError::RateLimited), "got {err:?}");
+    assert!(matches!(err, FetchError::RateLimited { .. }), "got {err:?}");
     assert_eq!(
         counter.load(Ordering::SeqCst),
         1,
@@ -582,6 +596,8 @@ async fn http_429_no_retry_after_is_rate_limited() {
             etag: None,
             last_modified: None,
             retry_after: None,
+            ratelimit_remaining: None,
+            ratelimit_reset_secs: None,
         }],
     );
     let err = h
@@ -589,7 +605,7 @@ async fn http_429_no_retry_after_is_rate_limited() {
         .browse_subreddit("LocalLLaMA", "hot", None, 25)
         .await
         .unwrap_err();
-    assert!(matches!(err, FetchError::RateLimited));
+    assert!(matches!(err, FetchError::RateLimited { .. }));
     assert_eq!(
         h.counter.load(Ordering::SeqCst),
         1,
@@ -612,6 +628,8 @@ async fn http_429_retry_after_then_200() {
                 etag: None,
                 last_modified: None,
                 retry_after: Some(1),
+                ratelimit_remaining: None,
+                ratelimit_reset_secs: None,
             },
             FakeHttp::atom(&body),
         ],
@@ -643,6 +661,8 @@ async fn http_429_twice_is_rate_limited() {
                 etag: None,
                 last_modified: None,
                 retry_after: Some(1),
+                ratelimit_remaining: None,
+                ratelimit_reset_secs: None,
             },
             FetchResponse {
                 status: 429,
@@ -651,6 +671,8 @@ async fn http_429_twice_is_rate_limited() {
                 etag: None,
                 last_modified: None,
                 retry_after: None,
+                ratelimit_remaining: None,
+                ratelimit_reset_secs: None,
             },
         ],
     );
@@ -659,7 +681,7 @@ async fn http_429_twice_is_rate_limited() {
         .browse_subreddit("LocalLLaMA", "hot", None, 25)
         .await
         .unwrap_err();
-    assert!(matches!(err, FetchError::RateLimited));
+    assert!(matches!(err, FetchError::RateLimited { .. }));
     assert_eq!(
         h.counter.load(Ordering::SeqCst),
         2,
@@ -682,6 +704,8 @@ async fn http_429_retry_after_zero_retries_immediately() {
                 etag: None,
                 last_modified: None,
                 retry_after: Some(0),
+                ratelimit_remaining: None,
+                ratelimit_reset_secs: None,
             },
             FakeHttp::atom(&body),
         ],
@@ -708,6 +732,8 @@ async fn http_500_is_http_error() {
             etag: None,
             last_modified: None,
             retry_after: None,
+            ratelimit_remaining: None,
+            ratelimit_reset_secs: None,
         }],
     );
     let err = h
@@ -743,6 +769,131 @@ async fn search_url_shape() {
     assert!(res.source.contains("restrict_sr=1"), "{}", res.source);
     assert!(res.source.contains("limit=5"), "{}", res.source);
     assert!(res.source.contains("t=week"), "{}", res.source);
+}
+
+#[tokio::test]
+async fn http_429_zero_reset_does_not_retry() {
+    let h = make_client(
+        1,
+        8,
+        vec![FetchResponse {
+            status: 429,
+            ratelimit_reset_secs: Some(0),
+            ..Default::default()
+        }],
+    );
+    let err = h
+        .client
+        .browse_subreddit("LocalLLaMA", "hot", None, 25)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            FetchError::RateLimited {
+                retry_after_secs: None
+            }
+        ),
+        "got {err:?}"
+    );
+    assert_eq!(h.counter.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn http_429_wait_at_least_limiter_budget_fails_fast() {
+    let h = make_client(
+        1,
+        8,
+        vec![FetchResponse {
+            status: 429,
+            ratelimit_reset_secs: Some(30),
+            ..Default::default()
+        }],
+    );
+    let err = h
+        .client
+        .browse_subreddit("LocalLLaMA", "hot", None, 25)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            FetchError::RateLimited {
+                retry_after_secs: Some(30)
+            }
+        ),
+        "got {err:?}"
+    );
+    assert_eq!(h.counter.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn quota_remaining_zero_blocks_next_call_when_hold_exceeds_quota_wait() {
+    let body = std::fs::read_to_string("tests/fixtures/subreddit.atom").unwrap();
+    let mut atom = FakeHttp::atom(&body);
+    atom.ratelimit_remaining = Some(0.0);
+    atom.ratelimit_reset_secs = Some(60);
+    let counter = Arc::new(AtomicUsize::new(0));
+    let timestamps = Arc::new(Mutex::new(Vec::new()));
+    let inm_log = Arc::new(Mutex::new(Vec::new()));
+    let fake = FakeHttp::new(
+        vec![atom.clone(), atom],
+        Arc::downgrade(&counter),
+        Arc::downgrade(&timestamps),
+        Arc::downgrade(&inm_log),
+    );
+    let client =
+        RedatomClient::with_budgets(Arc::new(fake), 1, 8, 30, 30, reddit_rss_mcp::ua::Ua::Honest);
+    client
+        .browse_subreddit("LocalLLaMA", "hot", None, 25)
+        .await
+        .unwrap();
+    let err = client
+        .browse_subreddit("LocalLLaMA", "hot", None, 25)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            FetchError::RateLimited {
+                retry_after_secs: Some(secs)
+            } if secs >= 1
+        ),
+        "got {err:?}"
+    );
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        1,
+        "second browse must not hit HTTP while quota hold exceeds quota wait"
+    );
+}
+
+#[tokio::test]
+async fn quota_hold_within_quota_wait_runs_after_reset() {
+    let body = std::fs::read_to_string("tests/fixtures/subreddit.atom").unwrap();
+    let mut atom = FakeHttp::atom(&body);
+    atom.ratelimit_remaining = Some(0.0);
+    atom.ratelimit_reset_secs = Some(1);
+    let counter = Arc::new(AtomicUsize::new(0));
+    let timestamps = Arc::new(Mutex::new(Vec::new()));
+    let inm_log = Arc::new(Mutex::new(Vec::new()));
+    let fake = FakeHttp::new(
+        vec![atom.clone(), atom],
+        Arc::downgrade(&counter),
+        Arc::downgrade(&timestamps),
+        Arc::downgrade(&inm_log),
+    );
+    let client =
+        RedatomClient::with_budgets(Arc::new(fake), 1, 8, 30, 90, reddit_rss_mcp::ua::Ua::Honest);
+    client
+        .browse_subreddit("LocalLLaMA", "hot", None, 25)
+        .await
+        .unwrap();
+    client
+        .browse_subreddit("MachineLearning", "hot", None, 25)
+        .await
+        .expect("second browse should wait ~1s then GET");
+    assert_eq!(counter.load(Ordering::SeqCst), 2);
 }
 
 // One ignored live test, documented for manual runs only.

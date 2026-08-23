@@ -26,11 +26,7 @@ use crate::ua::Ua;
 ///
 /// Returns an error if the MCP stdio session fails.
 pub async fn run_stdio() -> anyhow::Result<()> {
-    let client = Arc::new(RedatomClient::new(
-        Arc::new(ReqwestAdapter::new(Ua::from_env())),
-        min_interval_ms(),
-        cache_cap(),
-    ));
+    let client = reddit_client();
     let server = ToolServer::new(client);
     info!("stdio transport started");
     let (stdin, stdout) = rmcp::transport::stdio();
@@ -78,11 +74,7 @@ pub async fn run_http(bind: &str, key: &Option<String>) -> anyhow::Result<()> {
         anyhow::bail!("binding {bind} (non-loopback) requires REDDIT_RSS_MCP_KEY to be set");
     }
 
-    let client = Arc::new(RedatomClient::new(
-        Arc::new(ReqwestAdapter::new(Ua::from_env())),
-        min_interval_ms(),
-        cache_cap(),
-    ));
+    let client = reddit_client();
     let app = build_router(client, key, require_auth);
 
     info!(%addr, require_auth, "http transport starting");
@@ -130,6 +122,18 @@ async fn auth_middleware(
     }
 }
 
+/// Shared Reddit client: limiter + quota-hold waits from env.
+fn reddit_client() -> Arc<RedatomClient> {
+    Arc::new(RedatomClient::with_budgets(
+        Arc::new(ReqwestAdapter::new(Ua::from_env())),
+        min_interval_ms(),
+        cache_cap(),
+        limiter_wait_secs(),
+        quota_wait_secs(),
+        Ua::Honest,
+    ))
+}
+
 /// `REDDIT_RSS_MIN_INTERVAL_MS`, default 2000.
 fn min_interval_ms() -> u64 {
     std::env::var("REDDIT_RSS_MIN_INTERVAL_MS")
@@ -144,6 +148,23 @@ fn cache_cap() -> usize {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(256)
+}
+
+/// `REDDIT_RSS_LIMITER_WAIT_SECS`, default 30.
+fn limiter_wait_secs() -> u64 {
+    std::env::var("REDDIT_RSS_LIMITER_WAIT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30)
+}
+
+/// `REDDIT_RSS_QUOTA_WAIT_SECS`, default 90. Wait for Reddit `remaining=0`
+/// reset; independent of the governor permit budget.
+fn quota_wait_secs() -> u64 {
+    std::env::var("REDDIT_RSS_QUOTA_WAIT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(90)
 }
 
 #[cfg(test)]
