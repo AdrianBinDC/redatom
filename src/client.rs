@@ -27,8 +27,10 @@ use crate::domain::{BrowseResult, Comment, CommentsResult, Post, PostSummary, Se
 use crate::error::FetchError;
 use crate::ua::Ua;
 
+/// Blurb attached to comments tool results.
 const COMMENTS_NOTE: &str = "RSS comments: flat list (not threaded), no scores, ~25 max.";
 
+/// Hosts allowed for comments URLs and redirects.
 const ALLOWED_HOSTS: [&str; 4] = [
     "www.reddit.com",
     "reddit.com",
@@ -38,6 +40,12 @@ const ALLOWED_HOSTS: [&str; 4] = [
 
 /// Abstraction over HTTP so tests can use a fake backend.
 pub trait FeedHttp: Send + Sync + 'static {
+    /// GET `url` with `headers`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a boxed error on transport failure. Implementations may also
+    /// return [`FetchError`] (e.g. [`FetchError::ForbiddenHost`] after redirect).
     fn get<'a>(
         &'a self,
         url: &'a str,
@@ -48,26 +56,34 @@ pub trait FeedHttp: Send + Sync + 'static {
 /// Response metadata + body for one fetched URL.
 #[derive(Debug, Clone)]
 pub struct FetchResponse {
+    /// HTTP status code.
     pub status: u16,
+    /// `Content-Type` header, or empty.
     pub content_type: String,
+    /// Response body bytes.
     pub body: Vec<u8>,
+    /// `ETag` header when present.
     pub etag: Option<String>,
+    /// `Last-Modified` header when present.
     pub last_modified: Option<String>,
     /// `Retry-After` header value (seconds), when present.
     pub retry_after: Option<u64>,
 }
 
+/// Boxed async future used by [`FeedHttp::get`].
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Production HTTP backend (reqwest).
 #[derive(Clone)]
 pub struct ReqwestAdapter {
+    /// Shared reqwest client (timeouts + redirect policy).
     client: reqwest::Client,
+    /// Primary User-Agent for this process.
     ua: Ua,
 }
 
 impl ReqwestAdapter {
-    /// Total timeout in seconds, from `REDDIT_RSS_TIMEOUT_SECS` (default 20).
+    /// Build a client. Total timeout comes from `REDDIT_RSS_TIMEOUT_SECS` (default 20).
     pub fn new(ua: Ua) -> Self {
         let total_timeout = std::env::var("REDDIT_RSS_TIMEOUT_SECS")
             .ok()
@@ -90,6 +106,7 @@ impl ReqwestAdapter {
         Self { client, ua }
     }
 
+    /// User-Agent configured for this adapter.
     pub fn ua(&self) -> &Ua {
         &self.ua
     }
@@ -152,28 +169,38 @@ impl FeedHttp for ReqwestAdapter {
     }
 }
 
+/// Cached feed plus validators for conditional GET.
 #[derive(Clone)]
 struct CacheEntry {
+    /// Last `ETag` from Reddit.
     etag: Option<String>,
+    /// Last `Last-Modified` from Reddit.
     last_modified: Option<String>,
+    /// Parsed Atom feed.
     feed: Feed,
 }
 
 /// One Reddit RSS client. A single instance is shared by both transports;
 /// the limiter and semaphore inside are the process-wide gate.
 pub struct RedatomClient {
+    /// HTTP backend (reqwest or test fake).
     http: Arc<dyn FeedHttp>,
+    /// Process-wide minimum interval between outbound GETs.
     limiter: DefaultDirectRateLimiter,
+    /// At most one Reddit GET in flight.
     in_flight: Arc<Semaphore>,
     /// ETag/Last-Modified + parsed feed cache, keyed by exact request URL.
     cache: Mutex<LruCache<String, CacheEntry>>,
+    /// Primary User-Agent (may become sticky after a successful fallback).
     ua: Ua,
+    /// Max seconds to wait for a limiter permit.
     limiter_wait_secs: u64,
     /// Whether the one-time UA fallback has already been used.
     ua_fallback_used: std::sync::atomic::AtomicBool,
 }
 
 impl RedatomClient {
+    /// Construct with a 30s limiter wait budget.
     pub fn new(http: Arc<dyn FeedHttp>, min_interval_ms: u64, cache_cap: usize) -> Self {
         Self::with_wait(http, min_interval_ms, cache_cap, 30)
     }
@@ -221,6 +248,11 @@ impl RedatomClient {
         }
     }
 
+    /// Wait until the rate limiter grants a permit, or fail.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FetchError::RateLimited`] if no permit is granted within `wait_secs`.
     async fn acquire_permit(&self, wait_secs: u64) -> Result<(), FetchError> {
         let start = std::time::Instant::now();
         let deadline = start + Duration::from_secs(wait_secs);
@@ -246,6 +278,7 @@ impl RedatomClient {
         }
     }
 
+    /// Build request headers including UA and conditional GET validators.
     fn make_headers(&self, url: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -273,6 +306,11 @@ impl RedatomClient {
     }
 
     /// Parse + cache an already-received fresh (non-304) response body.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FetchError::Blocked`] if the body is not XML, [`FetchError::Parse`]
+    /// if Atom parsing fails, or [`FetchError::NotAtom`] if the feed is not Atom.
     fn parse_and_cache(&self, url: &str, resp: FetchResponse) -> Result<Feed, FetchError> {
         let looks_like_xml = resp.content_type.to_ascii_lowercase().contains("xml")
             || resp.body.starts_with(b"<?xml")
@@ -313,6 +351,11 @@ impl RedatomClient {
 
     /// GET one feed URL with the shared limiter + 1-in-flight semaphore.
     /// Returns the parsed Atom feed (cache hit or fresh parse).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`FetchError`] for limiter timeout, HTTP failures, blocked/WAF
+    /// responses, parse failures, or a 304 with an empty cache.
     #[instrument(skip(self, url), fields(url))]
     async fn fetch_feed(&self, url: &str) -> Result<Feed, FetchError> {
         self.acquire_permit(self.limiter_wait_secs).await?;
@@ -361,6 +404,11 @@ impl RedatomClient {
     }
 
     /// Handle a received response: 304 cache hit, error status, or parse + cache.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::parse_and_cache`], plus HTTP status mapping, 304 miss,
+    /// and [`Self::retry_with_fallback_ua`] on 403.
     async fn finish_fetch(&self, url: &str, resp: FetchResponse) -> Result<Feed, FetchError> {
         let status = resp.status;
 
@@ -393,6 +441,11 @@ impl RedatomClient {
     /// On HTTP 403, try one different User-Agent for the same URL.
     /// If that also fails or returns 403/HTML, return `Blocked`.
     /// If it succeeds with 200 Atom, the fallback UA becomes sticky.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FetchError::Blocked`] when no fallback is available or the
+    /// fallback still fails; otherwise the same errors as [`Self::parse_and_cache`].
     async fn retry_with_fallback_ua(&self, url: &str) -> Result<Feed, FetchError> {
         let ua_fallback = match self.ua_fallback_used.compare_exchange(
             false,
@@ -451,6 +504,10 @@ impl RedatomClient {
     }
 
     /// Browse a subreddit listing surface.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FetchError::InvalidSubreddit`] or any error from fetching/parsing the feed.
     pub async fn browse_subreddit(
         &self,
         subreddit: &str,
@@ -475,6 +532,11 @@ impl RedatomClient {
     }
 
     /// Search Reddit (sitewide or within a subreddit).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FetchError::InvalidQuery`], [`FetchError::InvalidSubreddit`], or
+    /// any error from fetching/parsing the feed.
     pub async fn search_reddit(
         &self,
         query: &str,
@@ -507,6 +569,10 @@ impl RedatomClient {
     }
 
     /// Fetch a post's comments feed (shallow, flat).
+    ///
+    /// # Errors
+    ///
+    /// Returns URL/host sanitization errors or any error from fetching/parsing the feed.
     pub async fn get_post_comments(
         &self,
         url: &str,
@@ -550,6 +616,10 @@ pub fn host_allowed(host: &str) -> bool {
 }
 
 /// Reject a URL whose host is not in the Reddit allowlist.
+///
+/// # Errors
+///
+/// Returns [`FetchError::ForbiddenHost`] when the host is not allowlisted.
 pub fn reject_if_forbidden(url: &Url) -> Result<(), FetchError> {
     let host = url.host_str().unwrap_or_default();
     if !host_allowed(host) {
@@ -559,6 +629,10 @@ pub fn reject_if_forbidden(url: &Url) -> Result<(), FetchError> {
 }
 
 /// Strip `r/`/leading slash; allow only `[A-Za-z0-9_+]`.
+///
+/// # Errors
+///
+/// Returns [`FetchError::InvalidSubreddit`] when the name is empty, too long, or has illegal characters.
 pub fn sanitize_subreddit(input: &str) -> Result<String, FetchError> {
     let cleaned = input
         .trim()
@@ -575,6 +649,7 @@ pub fn sanitize_subreddit(input: &str) -> Result<String, FetchError> {
     Ok(cleaned.to_string())
 }
 
+/// Build a listing `.rss` URL for `sub` and `sort`.
 fn build_browse_url(sub: &str, sort: &str, time: Option<&str>, limit: usize) -> String {
     let mut url = Url::parse(&format!("https://www.reddit.com/r/{sub}/{sort}.rss"))
         .expect("static URL template is valid");
@@ -586,6 +661,7 @@ fn build_browse_url(sub: &str, sort: &str, time: Option<&str>, limit: usize) -> 
     url.into()
 }
 
+/// Build a search `.rss` URL, optionally restricted to `sub`.
 fn build_search_url(
     query: &str,
     sub: Option<&str>,
@@ -613,6 +689,10 @@ fn build_search_url(
 
 /// Normalize a comments permalink: add scheme, drop fragment/query,
 /// append `.rss` unless already present.
+///
+/// # Errors
+///
+/// Returns [`FetchError::InvalidUrl`] when the input is empty, too long, or unparseable.
 pub fn normalize_comments_url(input: &str) -> Result<String, FetchError> {
     let s = input.trim();
     if s.is_empty() || s.len() > 2048 {
@@ -642,6 +722,7 @@ pub fn normalize_comments_url(input: &str) -> Result<String, FetchError> {
     ))
 }
 
+/// Map one Atom entry to a [`Post`].
 fn entry_to_post(entry: &Entry) -> Post {
     Post {
         title: entry
@@ -712,6 +793,7 @@ fn html_to_excerpt(html: &str) -> String {
     s.chars().take(500).collect()
 }
 
+/// Split a comments feed into the submission (if found) and remaining entries as comments.
 fn split_post_and_comments(feed: &Feed, limit: usize) -> (Option<PostSummary>, Vec<Comment>) {
     let entries = &feed.entries;
     if entries.is_empty() {
@@ -804,6 +886,7 @@ impl FeedHttp for NoopHttp {
 }
 
 #[cfg(test)]
+#[allow(missing_docs, clippy::missing_docs_in_private_items)]
 mod tests {
     use super::*;
 

@@ -26,3 +26,10 @@ axum = "0.8.9"
 [dev-dependencies]
 http = "1"
 tower = "0.5"
+
+[lints.rust]
+missing_docs = "deny"
+
+[lints.clippy]
+missing_docs_in_private_items = "deny"
+missing_errors_doc = "deny"

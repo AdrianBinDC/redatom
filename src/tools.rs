@@ -1,3 +1,5 @@
+//! MCP tool schemas and handlers wrapping [`crate::client::RedatomClient`].
+
 use std::sync::Arc;
 
 use rmcp::ErrorData;
@@ -9,39 +11,59 @@ use serde::{Deserialize, Serialize};
 
 use crate::client::RedatomClient;
 
+/// Listing sort for the `browse_subreddit` tool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum BrowseSort {
+    /// Hot listing (default).
     #[default]
     Hot,
+    /// Newest posts.
     New,
+    /// Top posts (uses `time` when set).
     Top,
+    /// Rising listing.
     Rising,
+    /// Controversial listing (uses `time` when set).
     Controversial,
 }
 
+/// Search ranking for the `search_reddit` tool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum SearchSort {
+    /// Relevance (default).
     #[default]
     Relevance,
+    /// Hot ranking.
     Hot,
+    /// Top ranking.
     Top,
+    /// Newest first.
     New,
+    /// Most comments.
     Comments,
 }
 
+/// Reddit `t=` time window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum TimeRange {
+    /// Past hour.
     Hour,
+    /// Past day.
     Day,
+    /// Past week.
     Week,
+    /// Past month.
     Month,
+    /// Past year.
     Year,
+    /// All time.
     All,
 }
 
+/// Arguments for `browse_subreddit`.
 #[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
 pub struct BrowseArgs {
     /// Subreddit name without the `r/` prefix, e.g. `LocalLLaMA`.
@@ -56,6 +78,7 @@ pub struct BrowseArgs {
     pub limit: Option<u32>,
 }
 
+/// Arguments for `search_reddit`.
 #[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
 pub struct SearchArgs {
     /// Search query (non-empty).
@@ -71,6 +94,7 @@ pub struct SearchArgs {
     pub limit: Option<u32>,
 }
 
+/// Arguments for `get_post_comments`.
 #[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
 pub struct CommentsArgs {
     /// Post permalink or already-`.rss` URL.
@@ -79,6 +103,7 @@ pub struct CommentsArgs {
     pub limit: Option<u32>,
 }
 
+/// Map [`TimeRange`] to Reddit `t=` query values.
 fn to_str_enum_time(time: Option<TimeRange>) -> Option<&'static str> {
     time.map(|t| match t {
         TimeRange::Hour => "hour",
@@ -90,6 +115,7 @@ fn to_str_enum_time(time: Option<TimeRange>) -> Option<&'static str> {
     })
 }
 
+/// Map [`BrowseSort`] to listing path segments.
 fn to_str_browse(sort: BrowseSort) -> &'static str {
     match sort {
         BrowseSort::Hot => "hot",
@@ -100,6 +126,7 @@ fn to_str_browse(sort: BrowseSort) -> &'static str {
     }
 }
 
+/// Map [`SearchSort`] to search `sort=` values.
 fn to_str_search(sort: SearchSort) -> &'static str {
     match sort {
         SearchSort::Relevance => "relevance",
@@ -110,6 +137,11 @@ fn to_str_search(sort: SearchSort) -> &'static str {
     }
 }
 
+/// Serialize a success payload as pretty JSON tool content.
+///
+/// # Errors
+///
+/// Returns [`ErrorData`] if JSON serialization fails.
 fn ok_json<T: Serialize>(value: &T) -> Result<CallToolResult, ErrorData> {
     serde_json::to_string_pretty(value)
         .map_err(|e| ErrorData::internal_error(e.to_string(), None))
@@ -134,17 +166,25 @@ pub fn tool_err_text(e: &crate::error::FetchError) -> String {
     format!("{variant}: {e}")
 }
 
+/// Wrap a fetch failure as an MCP tool error result (`is_error`).
+///
+/// # Errors
+///
+/// Always returns `Ok` with an error [`CallToolResult`]; the `Result` shape is required by rmcp.
 fn tool_error(e: &crate::error::FetchError) -> Result<CallToolResult, ErrorData> {
     Ok(CallToolResult::error(vec![
         rmcp::model::ContentBlock::text(tool_err_text(e)),
     ]))
 }
 
+/// MCP server holding the shared RSS client.
 pub struct ToolServer {
+    /// Process-wide Reddit RSS client.
     client: Arc<RedatomClient>,
 }
 
 impl ToolServer {
+    /// Wrap an existing client.
     pub fn new(client: Arc<RedatomClient>) -> Self {
         Self { client }
     }
@@ -156,6 +196,10 @@ impl ToolServer {
     /// RSS only: no scores, no comment trees, ~25 items max, no API key.
     /// Use hot/rising for temperature surfaces.
     /// time only applies to top and controversial sorts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorData`] only if success JSON cannot be serialized.
     #[tool(
         name = "browse_subreddit",
         annotations(read_only_hint = true, title = "Browse subreddit")
@@ -183,6 +227,10 @@ impl ToolServer {
     /// RSS only: no scores, no comment trees, ~25 items max, no API key.
     /// Set subreddit to restrict the search.
     /// time is sent as t= when provided.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorData`] only if success JSON cannot be serialized.
     #[tool(
         name = "search_reddit",
         annotations(read_only_hint = true, title = "Search Reddit")
@@ -210,6 +258,10 @@ impl ToolServer {
     /// Fetch comments for a Reddit post via its public Atom/RSS feed.
     /// Returns a flat list (not threaded), no scores, ~25 max.
     /// Accepts a permalink or an already-.rss URL.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorData`] only if success JSON cannot be serialized.
     #[tool(
         name = "get_post_comments",
         annotations(read_only_hint = true, title = "Get post comments")
@@ -230,6 +282,7 @@ impl ToolServer {
 }
 
 #[cfg(test)]
+#[allow(missing_docs, clippy::missing_docs_in_private_items)]
 mod tests {
     use super::*;
     use crate::error::FetchError;

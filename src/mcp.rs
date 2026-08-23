@@ -1,3 +1,5 @@
+//! stdio and Streamable HTTP MCP transports.
+
 use std::sync::Arc;
 
 use axum::{
@@ -19,6 +21,10 @@ use crate::tools::ToolServer;
 use crate::ua::Ua;
 
 /// Serve over stdio (default transport).
+///
+/// # Errors
+///
+/// Returns an error if the MCP stdio session fails.
 pub async fn run_stdio() -> anyhow::Result<()> {
     let client = Arc::new(RedatomClient::new(
         Arc::new(ReqwestAdapter::new(Ua::from_env())),
@@ -32,6 +38,7 @@ pub async fn run_stdio() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Build `/health` (no auth) plus `/mcp` (optional bearer).
 fn build_router(client: Arc<RedatomClient>, key: &Option<String>, require_auth: bool) -> Router {
     let server_factory = move || Ok(ToolServer::new(client.clone()));
 
@@ -55,6 +62,11 @@ fn build_router(client: Arc<RedatomClient>, key: &Option<String>, require_auth: 
 }
 
 /// Serve over Streamable HTTP at `/mcp`, plus `GET /health`.
+///
+/// # Errors
+///
+/// Returns an error if `--bind` is invalid, a non-loopback bind has no key,
+/// bind fails, or the HTTP server exits with an error.
 pub async fn run_http(bind: &str, key: &Option<String>) -> anyhow::Result<()> {
     let addr: std::net::SocketAddr = bind
         .parse()
@@ -79,16 +91,21 @@ pub async fn run_http(bind: &str, key: &Option<String>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Liveness JSON; never contacts Reddit and never requires a bearer token.
 async fn health() -> impl IntoResponse {
     (StatusCode::OK, serde_json::json!({"ok": true}).to_string())
 }
 
+/// Bearer token state for `/mcp`.
 #[derive(Clone)]
 struct BearerAuth {
+    /// Expected `REDDIT_RSS_MCP_KEY` value.
     key: Option<String>,
+    /// When true, reject requests without a matching `Authorization` header.
     require: bool,
 }
 
+/// Require `Authorization: Bearer` when [`BearerAuth::require`] is set.
 async fn auth_middleware(
     State(auth): State<BearerAuth>,
     req: Request<axum::body::Body>,
@@ -113,6 +130,7 @@ async fn auth_middleware(
     }
 }
 
+/// `REDDIT_RSS_MIN_INTERVAL_MS`, default 2000.
 fn min_interval_ms() -> u64 {
     std::env::var("REDDIT_RSS_MIN_INTERVAL_MS")
         .ok()
@@ -120,6 +138,7 @@ fn min_interval_ms() -> u64 {
         .unwrap_or(2000)
 }
 
+/// `REDDIT_RSS_CACHE_CAP`, default 256.
 fn cache_cap() -> usize {
     std::env::var("REDDIT_RSS_CACHE_CAP")
         .ok()
@@ -128,6 +147,7 @@ fn cache_cap() -> usize {
 }
 
 #[cfg(test)]
+#[allow(missing_docs, clippy::missing_docs_in_private_items)]
 mod tests {
     use super::*;
     use crate::client::{NoopHttp, RedatomClient};

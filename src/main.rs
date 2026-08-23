@@ -1,3 +1,5 @@
+//! Binary entry: stdio MCP by default, or Streamable HTTP with `--http`.
+
 use clap::Parser;
 use reddit_rss_mcp::mcp;
 use tracing::info;
@@ -20,6 +22,7 @@ struct Cli {
     stdio: bool,
 }
 
+/// Initialize tracing (human or JSON via `REDDIT_RSS_LOG_JSON=1`).
 fn init_logging() {
     let env_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("reddit_rss_mcp=info,warn"));
@@ -40,6 +43,11 @@ fn init_logging() {
     }
 }
 
+/// Parse CLI flags and run the selected transport.
+///
+/// # Errors
+///
+/// Returns an error if the HTTP bind/key check fails or the transport exits with an error.
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     init_logging();

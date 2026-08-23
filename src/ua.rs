@@ -1,18 +1,28 @@
-/// User-Agent selection. One value is picked at process start and reused
-/// for the lifetime of the process (no rotation, no pool).
+//! Sticky User-Agent selection for the process lifetime.
+
+/// Honest, identifiable product UA.
 const HONEST: &str = "reddit-rss-mcp/0.1 (+https://github.com/AdrianBinDC/redatom)";
+/// Feed-reader style UA (fallback identity).
 const READER: &str = "NetNewsWire/6.1";
+/// Platform-matched browser UA (Linux aarch64 Firefox).
 const FIREFOX: &str = "Mozilla/5.0 (X11; Linux aarch64; rv:140.0) Gecko/20100101 Firefox/140.0";
 
+/// User-Agent identity. One value is picked at process start and reused
+/// (no per-request rotation pool).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Ua {
+    /// `reddit-rss-mcp/0.1 (+https://github.com/AdrianBinDC/redatom)`.
     Honest,
+    /// Feed-reader UA.
     Reader,
+    /// Current Firefox on Linux aarch64.
     Firefox,
+    /// Exact `REDDIT_RSS_UA` override.
     Custom(String),
 }
 
 impl Ua {
+    /// Header value to send as `User-Agent`.
     pub fn header(&self) -> String {
         match self {
             Ua::Honest => HONEST.to_string(),
@@ -43,8 +53,7 @@ impl Ua {
         }
     }
 
-    /// Return one distinct fallback UA identity, or `None` if this is
-    /// already the last fallback to try.
+    /// Return one distinct fallback identity, or `None` if this UA has no next hop.
     pub fn fallback(&self) -> Option<Ua> {
         match self {
             Ua::Honest => Some(Ua::Reader),
@@ -55,6 +64,7 @@ impl Ua {
 }
 
 #[cfg(test)]
+#[allow(missing_docs, clippy::missing_docs_in_private_items)]
 mod tests {
     use super::*;
 
