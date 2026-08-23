@@ -1,5 +1,10 @@
 # redatom
 
+<p align="center">
+  <a href="https://github.com/AdrianBinDC/redatom/actions/workflows/ci.yml"><img src="https://github.com/AdrianBinDC/redatom/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
+</p>
+
 Rust MCP server that reads Reddit via public Atom/RSS (`.rss`) endpoints only. No OAuth, no PRAW, no HTML scraping, no `.json` API.
 
 ## What it does
