@@ -289,22 +289,48 @@ impl RedatomClient {
             .expect("semaphore not closed");
 
         let headers = self.make_headers(url);
-        let resp = self.http.get(url, &headers).await.map_err(|e| {
-            error!(%e, "network error");
-            FetchError::Network(e.to_string())
-        })?;
+        let resp = self.http.get(url, &headers).await.map_err(map_http_error)?;
 
+        if resp.status == 429 {
+            // Release the in-flight permit before retrying so we don't
+            // deadlock on the 1-permit semaphore.
+            drop(_in_flight);
+            if let Some(wait) = resp.retry_after {
+                let capped = wait.min(60);
+                if capped > 0 {
+                    info!(wait_secs = capped, "honoring Retry-After once");
+                    tokio::time::sleep(Duration::from_secs(capped)).await;
+                }
+                let _in_flight2 = self
+                    .in_flight
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .expect("semaphore not closed");
+                self.acquire_permit(self.limiter_wait_secs).await?;
+                let headers2 = self.make_headers(url);
+                let resp2 = self
+                    .http
+                    .get(url, &headers2)
+                    .await
+                    .map_err(map_http_error)?;
+                drop(_in_flight2);
+                if resp2.status != 429 {
+                    return self.finish_fetch(url, resp2);
+                }
+            }
+            error!("HTTP 429 from reddit");
+            return Err(FetchError::RateLimited);
+        }
+
+        self.finish_fetch(url, resp)
+    }
+
+    /// Handle a received response: 304 cache hit, error status, or parse + cache.
+    fn finish_fetch(&self, url: &str, resp: FetchResponse) -> Result<Feed, FetchError> {
         let status = resp.status;
 
         match status {
-            429 => {
-                error!("HTTP 429 from reddit");
-                return Err(FetchError::RateLimited);
-            }
-            403 => {
-                error!("HTTP 403 (WAF) from reddit");
-                return Err(FetchError::Blocked);
-            }
             304 => {
                 let cached = self.cache.lock().ok().and_then(|mut c| c.get(url).cloned());
                 match cached {
@@ -318,9 +344,13 @@ impl RedatomClient {
                     }
                 }
             }
+            403 => {
+                error!("HTTP 403 (WAF) from reddit");
+                Err(FetchError::Blocked)
+            }
             s if !(200..300).contains(&s) => {
                 error!(status = s, "HTTP error");
-                return Err(FetchError::Http(s));
+                Err(FetchError::Http(s))
             }
             _ => self.parse_and_cache(url, resp),
         }
@@ -408,6 +438,19 @@ impl RedatomClient {
             note: COMMENTS_NOTE.to_string(),
         })
     }
+}
+
+/// Map a `Box<dyn Error>` from the HTTP backend to a typed `FetchError`.
+/// Timeout errors (connect or total) become `FetchError::Timeout`.
+fn map_http_error(e: Box<dyn std::error::Error + Send + Sync>) -> FetchError {
+    if let Some(req_err) = e.downcast_ref::<reqwest::Error>()
+        && req_err.is_timeout()
+    {
+        error!(%req_err, "request timed out");
+        return FetchError::Timeout;
+    }
+    error!(%e, "network error");
+    FetchError::Network(e.to_string())
 }
 
 /// Strip `r/`/leading slash; allow only `[A-Za-z0-9_+]`.
@@ -686,6 +729,13 @@ mod tests {
             html_to_excerpt("<div class=\"md\"><p>Hi &amp; hello</p></div>"),
             "Hi & hello"
         );
+    }
+
+    #[test]
+    fn map_http_error_non_reqwest_is_network() {
+        let err: Box<dyn std::error::Error + Send + Sync> =
+            Box::new(std::io::Error::other("connection refused"));
+        assert!(matches!(map_http_error(err), FetchError::Network(_)));
     }
 
     #[test]
