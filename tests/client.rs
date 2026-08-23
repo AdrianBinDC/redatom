@@ -4,36 +4,37 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use reddit_rss_mcp::client::{BoxFuture, FeedHttp, FetchResponse, RedatomClient};
 use reddit_rss_mcp::error::FetchError;
 
-/// Fake HTTP backend: replays pre-recorded responses in order and records
-/// call counts + timestamps so tests can assert spacing.
+/// Fake HTTP backend: replays pre-recorded responses from a shared queue
+/// and records call counts, timestamps, and If-None-Match headers.
 ///
-/// `call_counter` / `timestamps` use `Weak` so the test can clone the
-/// `RedatomClient` (which holds an `Arc<dyn FeedHttp>`) and observe the
-/// fake's state without keeping it alive via the client.
+/// `responses` is `Arc<Mutex<VecDeque>>` so every call pops from the same
+/// queue (sequential 304 / LRU revalidation works). The `Weak` counters let
+/// the test keep observing the fake after the `RedatomClient` (which holds
+/// an `Arc<dyn FeedHttp>`) is built.
 struct FakeHttp {
-    responses: Mutex<VecDeque<FetchResponse>>,
+    responses: Arc<Mutex<VecDeque<FetchResponse>>>,
     call_counter: Weak<AtomicUsize>,
     timestamps: Weak<Mutex<Vec<Instant>>>,
+    if_none_match_log: Weak<Mutex<Vec<Option<String>>>>,
 }
-
-// Keep the real `Instant` type import short
-use std::time::Instant;
 
 impl FakeHttp {
     fn new(
         responses: Vec<FetchResponse>,
         counter: Weak<AtomicUsize>,
         timestamps: Weak<Mutex<Vec<Instant>>>,
+        inm_log: Weak<Mutex<Vec<Option<String>>>>,
     ) -> Self {
         Self {
-            responses: Mutex::new(responses.into()),
+            responses: Arc::new(Mutex::new(responses.into())),
             call_counter: counter,
             timestamps,
+            if_none_match_log: inm_log,
         }
     }
 
@@ -55,11 +56,14 @@ impl FeedHttp for FakeHttp {
         _url: &str,
         _headers: &reqwest::header::HeaderMap,
     ) -> BoxFuture<'_, Result<FetchResponse, Box<dyn std::error::Error + Send + Sync>>> {
-        let responses = Arc::new(Mutex::new(VecDeque::new()));
-        // Move responses into the shared arc so the future can access them.
-        *responses.lock().unwrap() = self.responses.lock().unwrap().clone();
+        let responses = Arc::clone(&self.responses);
         let counter = self.call_counter.clone();
         let timestamps = self.timestamps.clone();
+        let inm_log = self.if_none_match_log.clone();
+        let inm_value = _headers
+            .get(reqwest::header::IF_NONE_MATCH)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
 
         Box::pin(async move {
             if let Some(counter) = counter.upgrade() {
@@ -67,6 +71,9 @@ impl FeedHttp for FakeHttp {
             }
             if let Some(ts) = timestamps.upgrade() {
                 ts.lock().unwrap().push(Instant::now());
+            }
+            if let Some(inm) = inm_log.upgrade() {
+                inm.lock().unwrap().push(inm_value);
             }
             let resp = responses.lock().unwrap().pop_front().ok_or_else(|| {
                 Box::new(std::io::Error::new(
@@ -79,28 +86,39 @@ impl FeedHttp for FakeHttp {
     }
 }
 
-fn make_client(
-    interval_ms: u64,
-    cache_cap: usize,
-    responses: Vec<FetchResponse>,
-) -> (RedatomClient, Arc<AtomicUsize>, Arc<Mutex<Vec<Instant>>>) {
+/// Bundle of handles a test needs: the client plus observables into the
+/// fake backend.
+struct TestHandle {
+    client: RedatomClient,
+    counter: Arc<AtomicUsize>,
+    if_none_match_log: Arc<Mutex<Vec<Option<String>>>>,
+}
+
+fn make_client(interval_ms: u64, cache_cap: usize, responses: Vec<FetchResponse>) -> TestHandle {
     let counter = Arc::new(AtomicUsize::new(0));
     let timestamps = Arc::new(Mutex::new(Vec::new()));
+    let inm_log = Arc::new(Mutex::new(Vec::new()));
     let fake = FakeHttp::new(
         responses,
         Arc::downgrade(&counter),
         Arc::downgrade(&timestamps),
+        Arc::downgrade(&inm_log),
     );
     let client = RedatomClient::with_wait(Arc::new(fake), interval_ms, cache_cap, 30);
-    (client, counter, timestamps)
+    TestHandle {
+        client,
+        counter,
+        if_none_match_log: inm_log,
+    }
 }
 
 // 1. Subreddit Atom -> posts with titles/links.
 #[tokio::test]
 async fn browse_subreddit_parses_posts() {
     let body = std::fs::read_to_string("tests/fixtures/subreddit.atom").unwrap();
-    let (c, _, _) = make_client(1, 8, vec![FakeHttp::atom(&body)]);
-    let res = c
+    let h = make_client(1, 8, vec![FakeHttp::atom(&body)]);
+    let res = h
+        .client
         .browse_subreddit("LocalLLaMA", "hot", None, 25)
         .await
         .expect("browse succeeds");
@@ -120,8 +138,9 @@ async fn browse_subreddit_parses_posts() {
 #[tokio::test]
 async fn comments_atom_has_post_and_comments() {
     let body = std::fs::read_to_string("tests/fixtures/comments.atom").unwrap();
-    let (c, _, _) = make_client(1, 8, vec![FakeHttp::atom(&body)]);
-    let res = c
+    let h = make_client(1, 8, vec![FakeHttp::atom(&body)]);
+    let res = h
+        .client
         .get_post_comments(
             "https://www.reddit.com/r/LocalLLaMA/comments/1vv0000/hot_post_about_llms/",
             25,
@@ -140,7 +159,7 @@ async fn comments_atom_has_post_and_comments() {
 #[tokio::test]
 async fn html_403_is_blocked() {
     let waf = std::fs::read_to_string("tests/fixtures/waf.html").unwrap();
-    let (c, _, _) = make_client(
+    let h = make_client(
         1,
         8,
         vec![FetchResponse {
@@ -152,7 +171,8 @@ async fn html_403_is_blocked() {
             retry_after: None,
         }],
     );
-    let err = c
+    let err = h
+        .client
         .browse_subreddit("LocalLLaMA", "hot", None, 25)
         .await
         .unwrap_err();
@@ -163,7 +183,7 @@ async fn html_403_is_blocked() {
 #[tokio::test]
 async fn waf_200_html_is_blocked() {
     let waf = std::fs::read_to_string("tests/fixtures/waf.html").unwrap();
-    let (c, _, _) = make_client(
+    let h = make_client(
         1,
         8,
         vec![FetchResponse {
@@ -175,7 +195,8 @@ async fn waf_200_html_is_blocked() {
             retry_after: None,
         }],
     );
-    let err = c
+    let err = h
+        .client
         .browse_subreddit("LocalLLaMA", "hot", None, 25)
         .await
         .unwrap_err();
@@ -191,8 +212,8 @@ async fn comments_forbidden_host() {
         "http://169.254.169.254/r/x/comments/a/b/",
         "https://evil.example.com/r/x/comments/a/b/",
     ] {
-        let (c, _, _) = make_client(1, 8, vec![FakeHttp::atom(&body)]);
-        let err = c.get_post_comments(bad, 25).await.unwrap_err();
+        let h = make_client(1, 8, vec![FakeHttp::atom(&body)]);
+        let err = h.client.get_post_comments(bad, 25).await.unwrap_err();
         assert!(
             matches!(err, FetchError::ForbiddenHost(_)),
             "expected ForbiddenHost for {bad}, got {err:?}"
@@ -204,13 +225,21 @@ async fn comments_forbidden_host() {
 #[tokio::test]
 async fn sanitize_rules() {
     let body = std::fs::read_to_string("tests/fixtures/subreddit.atom").unwrap();
-    let (c, _, _) = make_client(1, 8, vec![FakeHttp::atom(&body)]);
-    let res = c.browse_subreddit("r/Foo", "hot", None, 5).await.unwrap();
+    let h = make_client(1, 8, vec![FakeHttp::atom(&body)]);
+    let res = h
+        .client
+        .browse_subreddit("r/Foo", "hot", None, 5)
+        .await
+        .unwrap();
     assert!(res.source.contains("/r/Foo/hot.rss"));
 
     for bad in ["../etc", "a/b", "sub.example.com", "", "r/"] {
-        let (c, _, _) = make_client(1, 8, vec![]);
-        let err = c.browse_subreddit(bad, "hot", None, 5).await.unwrap_err();
+        let h = make_client(1, 8, vec![]);
+        let err = h
+            .client
+            .browse_subreddit(bad, "hot", None, 5)
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, FetchError::InvalidSubreddit(_)),
             "expected InvalidSubreddit for {bad:?}, got {err:?}"
@@ -223,8 +252,9 @@ async fn sanitize_rules() {
 async fn limit_clamped_to_1_25() {
     let body = std::fs::read_to_string("tests/fixtures/subreddit.atom").unwrap();
     // limit=0 clamps to 1 (URL shows limit=1, take(1) → 1 post)
-    let (c, _, _) = make_client(1, 8, vec![FakeHttp::atom(&body)]);
-    let res = c
+    let h = make_client(1, 8, vec![FakeHttp::atom(&body)]);
+    let res = h
+        .client
         .browse_subreddit("LocalLLaMA", "hot", None, 0)
         .await
         .unwrap();
@@ -239,8 +269,9 @@ async fn limit_clamped_to_1_25() {
     );
 
     // limit=100 clamps to 25 (URL shows limit=25, take(25) → all 3 fixture posts)
-    let (c, _, _) = make_client(1, 8, vec![FakeHttp::atom(&body)]);
-    let res = c
+    let h = make_client(1, 8, vec![FakeHttp::atom(&body)]);
+    let res = h
+        .client
         .browse_subreddit("LocalLLaMA", "hot", None, 100)
         .await
         .unwrap();
@@ -267,17 +298,44 @@ async fn etag_304_serves_cache() {
             retry_after: None,
         },
     ];
-    let (c, _, _) = make_client(1, 8, responses);
-    let first = c
+    let h = make_client(1, 8, responses);
+    let first = h
+        .client
         .browse_subreddit("LocalLLaMA", "hot", None, 25)
         .await
         .unwrap();
-    let second = c
+    assert!(
+        h.if_none_match_log
+            .lock()
+            .unwrap()
+            .first()
+            .is_none_or(Option::is_none),
+        "first call must not send If-None-Match, got {:?}",
+        h.if_none_match_log.lock().unwrap().first()
+    );
+    let second = h
+        .client
         .browse_subreddit("LocalLLaMA", "hot", None, 25)
         .await
         .unwrap();
     assert_eq!(first.count, 3);
     assert_eq!(second.count, 3, "304 must return cached parse");
+    assert_eq!(
+        h.counter.load(Ordering::SeqCst),
+        2,
+        "exactly two HTTP calls (200 then 304)"
+    );
+    let inm = h.if_none_match_log.lock().unwrap();
+    assert!(
+        inm.first().is_none_or(Option::is_none),
+        "first call must not send If-None-Match, got {:?}",
+        inm.first()
+    );
+    assert!(
+        inm.get(1).is_some_and(|v| v.as_deref() == Some("\"v1\"")),
+        "second call must send the stored ETag as If-None-Match, got {:?}",
+        inm.get(1)
+    );
 }
 
 // 7b. LRU evicts oldest; a later fetch for an evicted URL is a full GET.
@@ -290,12 +348,30 @@ async fn lru_evicts_oldest() {
         FakeHttp::atom(&body),
         FakeHttp::atom(&body),
     ];
-    let (c, _, _) = make_client(1, 2, responses);
-    c.browse_subreddit("aaa", "hot", None, 25).await.unwrap();
-    c.browse_subreddit("bbb", "hot", None, 25).await.unwrap();
-    c.browse_subreddit("ccc", "hot", None, 25).await.unwrap(); // evicts "aaa"
-    let res = c.browse_subreddit("aaa", "hot", None, 25).await.unwrap();
+    let h = make_client(1, 2, responses);
+    h.client
+        .browse_subreddit("aaa", "hot", None, 25)
+        .await
+        .unwrap();
+    h.client
+        .browse_subreddit("bbb", "hot", None, 25)
+        .await
+        .unwrap();
+    h.client
+        .browse_subreddit("ccc", "hot", None, 25)
+        .await
+        .unwrap(); // evicts "aaa"
+    let res = h
+        .client
+        .browse_subreddit("aaa", "hot", None, 25)
+        .await
+        .unwrap();
     assert_eq!(res.count, 3);
+    assert_eq!(
+        h.counter.load(Ordering::SeqCst),
+        4,
+        "four distinct GETs for cap-2 LRU with 4 different URLs"
+    );
 }
 
 // 8. Concurrent browse calls: at most one in-flight; starts spaced >= min interval.
@@ -310,10 +386,12 @@ async fn concurrent_calls_serialized_with_spacing() {
 
     let counter = Arc::new(AtomicUsize::new(0));
     let timestamps = Arc::new(Mutex::new(Vec::new()));
+    let inm_log = Arc::new(Mutex::new(Vec::new()));
     let fake = FakeHttp::new(
         responses,
         Arc::downgrade(&counter),
         Arc::downgrade(&timestamps),
+        Arc::downgrade(&inm_log),
     );
     let client = Arc::new(RedatomClient::with_wait(Arc::new(fake), 500, 8, 30));
 
@@ -352,11 +430,13 @@ async fn limiter_wait_zero_returns_rate_limited() {
     let body = std::fs::read_to_string("tests/fixtures/subreddit.atom").unwrap();
     let counter = Arc::new(AtomicUsize::new(0));
     let timestamps = Arc::new(Mutex::new(Vec::new()));
-    let fake = FakeHttp {
-        responses: std::sync::Mutex::new(vec![FakeHttp::atom(&body)].into()),
-        call_counter: Arc::downgrade(&counter),
-        timestamps: Arc::downgrade(&timestamps),
-    };
+    let inm_log = Arc::new(Mutex::new(Vec::new()));
+    let fake = FakeHttp::new(
+        vec![FakeHttp::atom(&body)],
+        Arc::downgrade(&counter),
+        Arc::downgrade(&timestamps),
+        Arc::downgrade(&inm_log),
+    );
     let c = RedatomClient::with_wait(Arc::new(fake), 1000, 8, 0);
     let r1 = c
         .browse_subreddit("LocalLLaMA", "hot", None, 25)
@@ -378,19 +458,24 @@ async fn limiter_wait_zero_returns_rate_limited() {
 // 10b. Empty search query -> InvalidQuery without any HTTP call.
 #[tokio::test]
 async fn search_empty_query_is_invalid() {
-    let (c, counter, _) = make_client(1, 8, vec![]);
-    let err = c
+    let h = make_client(1, 8, vec![]);
+    let err = h
+        .client
         .search_reddit("   ", None, "relevance", None, 25)
         .await
         .unwrap_err();
     assert!(matches!(err, FetchError::InvalidQuery));
-    assert_eq!(counter.load(Ordering::SeqCst), 0, "no HTTP for empty query");
+    assert_eq!(
+        h.counter.load(Ordering::SeqCst),
+        0,
+        "no HTTP for empty query"
+    );
 }
 
 // Extra: 429 -> RateLimited.
 #[tokio::test]
 async fn http_429_is_rate_limited() {
-    let (c, _, _) = make_client(
+    let h = make_client(
         1,
         8,
         vec![FetchResponse {
@@ -402,7 +487,8 @@ async fn http_429_is_rate_limited() {
             retry_after: None,
         }],
     );
-    let err = c
+    let err = h
+        .client
         .browse_subreddit("LocalLLaMA", "hot", None, 25)
         .await
         .unwrap_err();
@@ -412,7 +498,7 @@ async fn http_429_is_rate_limited() {
 // Extra: 500 -> Http(500).
 #[tokio::test]
 async fn http_500_is_http_error() {
-    let (c, _, _) = make_client(
+    let h = make_client(
         1,
         8,
         vec![FetchResponse {
@@ -424,7 +510,8 @@ async fn http_500_is_http_error() {
             retry_after: None,
         }],
     );
-    let err = c
+    let err = h
+        .client
         .browse_subreddit("LocalLLaMA", "hot", None, 25)
         .await
         .unwrap_err();
@@ -435,8 +522,9 @@ async fn http_500_is_http_error() {
 #[tokio::test]
 async fn search_url_shape() {
     let body = std::fs::read_to_string("tests/fixtures/subreddit.atom").unwrap();
-    let (c, _, _) = make_client(1, 8, vec![FakeHttp::atom(&body)]);
-    let res = c
+    let h = make_client(1, 8, vec![FakeHttp::atom(&body)]);
+    let res = h
+        .client
         .search_reddit(
             "llm quant",
             Some("LocalLLaMA"),
