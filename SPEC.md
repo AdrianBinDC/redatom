@@ -261,7 +261,7 @@ Use `rmcp` (MCP 2025-11-25). Do not hand-roll NDJSON.
 
 - `tokio`
 - `rmcp` (`server`, `transport-io`, streamable-http server)
-- `reqwest` + rustls (avoid `openssl-sys`)
+- `reqwest` + `native-tls` (OpenSSL). rustls’s TLS fingerprint is 403’d by Reddit; curl/OpenSSL is not.
 - `feed-rs` for Atom (not regex)
 - `serde` / `serde_json` / `schemars` as `rmcp` needs
 - `thiserror`
