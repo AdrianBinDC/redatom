@@ -6,6 +6,9 @@
 FROM --platform=$BUILDPLATFORM rust:1-bookworm AS builder
 ARG TARGETPLATFORM=linux/arm64
 WORKDIR /app
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends pkg-config libssl-dev && \
+    rm -rf /var/lib/apt/lists/*
 COPY . .
 RUN case "$TARGETPLATFORM" in \
       linux/arm64)  TARGET=aarch64-unknown-linux-gnu ;; \
@@ -26,7 +29,7 @@ RUN case "$TARGETPLATFORM" in \
 # NOT call Reddit.
 FROM debian:bookworm-slim
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl && \
+    apt-get install -y --no-install-recommends ca-certificates libssl3 curl && \
     rm -rf /var/lib/apt/lists/*
 RUN useradd --create-home mcp
 USER mcp

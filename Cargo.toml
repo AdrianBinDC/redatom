@@ -11,7 +11,7 @@ clap = { version = "4", features = ["derive"] }
 feed-rs = "2.4"
 governor = "0.10"
 lru = "0.18"
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "native-tls"] }
 rmcp = { version = "3.1", features = ["server", "transport-io", "transport-streamable-http-server"] }
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
