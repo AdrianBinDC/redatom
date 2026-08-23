@@ -1,3 +1,6 @@
 # Rust build artifacts
-target/
-Cargo.lock
+/target/
+
+# Agent scratch (experiments, throwaway crates, raw Atom dumps). Never commit.
+/tmp/*
+!/tmp/.gitkeep
