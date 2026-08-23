@@ -1,4 +1,4 @@
-# reddit-rss-mcp
+# redatom
 
 Rust MCP server that reads Reddit via public Atom/RSS (`.rss`) endpoints only. No OAuth, no PRAW, no HTML scraping, no `.json` API.
 
