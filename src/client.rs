@@ -305,10 +305,6 @@ impl RedatomClient {
                 error!("HTTP 403 (WAF) from reddit");
                 return Err(FetchError::Blocked);
             }
-            s if !(200..300).contains(&s) => {
-                error!(status = s, "HTTP error");
-                return Err(FetchError::Http(s));
-            }
             304 => {
                 let cached = self.cache.lock().ok().and_then(|mut c| c.get(url).cloned());
                 match cached {
@@ -321,6 +317,10 @@ impl RedatomClient {
                         Err(FetchError::NotAtom)
                     }
                 }
+            }
+            s if !(200..300).contains(&s) => {
+                error!(status = s, "HTTP error");
+                return Err(FetchError::Http(s));
             }
             _ => self.parse_and_cache(url, resp),
         }
