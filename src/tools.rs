@@ -113,11 +113,31 @@ fn to_str_search(sort: SearchSort) -> &'static str {
 fn ok_json<T: Serialize>(value: &T) -> Result<CallToolResult, ErrorData> {
     serde_json::to_string_pretty(value)
         .map_err(|e| ErrorData::internal_error(e.to_string(), None))
-        .map(|text| {
-            CallToolResult::success(vec![rmcp::model::ContentBlock::text(format!(
-                "```json\n{text}\n```"
-            ))])
-        })
+        .map(|text| CallToolResult::success(vec![rmcp::model::ContentBlock::text(text)]))
+}
+
+/// Render a `FetchError` as `Variant: Display` for a tool error message.
+pub fn tool_err_text(e: &crate::error::FetchError) -> String {
+    let variant = match e {
+        crate::error::FetchError::InvalidSubreddit(_) => "InvalidSubreddit",
+        crate::error::FetchError::InvalidQuery => "InvalidQuery",
+        crate::error::FetchError::InvalidUrl(_) => "InvalidUrl",
+        crate::error::FetchError::ForbiddenHost(_) => "ForbiddenHost",
+        crate::error::FetchError::Blocked => "Blocked",
+        crate::error::FetchError::RateLimited => "RateLimited",
+        crate::error::FetchError::Http(_) => "Http",
+        crate::error::FetchError::NotAtom => "NotAtom",
+        crate::error::FetchError::Timeout => "Timeout",
+        crate::error::FetchError::Network(_) => "Network",
+        crate::error::FetchError::Parse(_) => "Parse",
+    };
+    format!("{variant}: {e}")
+}
+
+fn tool_error(e: &crate::error::FetchError) -> Result<CallToolResult, ErrorData> {
+    Ok(CallToolResult::error(vec![rmcp::model::ContentBlock::text(
+        tool_err_text(e),
+    )]))
 }
 
 pub struct ToolServer {
@@ -155,7 +175,7 @@ impl ToolServer {
             .await
         {
             Ok(result) => ok_json(&result),
-            Err(e) => Err(ErrorData::internal_error(e.to_string(), None)),
+            Err(e) => tool_error(&e),
         }
     }
 
