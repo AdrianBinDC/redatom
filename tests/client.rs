@@ -472,9 +472,9 @@ async fn search_empty_query_is_invalid() {
     );
 }
 
-// Extra: 429 -> RateLimited.
+// Extra: 429 with no Retry-After -> RateLimited immediately.
 #[tokio::test]
-async fn http_429_is_rate_limited() {
+async fn http_429_no_retry_after_is_rate_limited() {
     let h = make_client(
         1,
         8,
@@ -493,6 +493,109 @@ async fn http_429_is_rate_limited() {
         .await
         .unwrap_err();
     assert!(matches!(err, FetchError::RateLimited));
+    assert_eq!(
+        h.counter.load(Ordering::SeqCst),
+        1,
+        "single HTTP call, no retry"
+    );
+}
+
+// 429 with Retry-After then 200 -> Ok (one retry).
+#[tokio::test]
+async fn http_429_retry_after_then_200() {
+    let body = std::fs::read_to_string("tests/fixtures/subreddit.atom").unwrap();
+    let h = make_client(
+        1,
+        8,
+        vec![
+            FetchResponse {
+                status: 429,
+                content_type: String::new(),
+                body: Vec::new(),
+                etag: None,
+                last_modified: None,
+                retry_after: Some(1),
+            },
+            FakeHttp::atom(&body),
+        ],
+    );
+    let res = h
+        .client
+        .browse_subreddit("LocalLLaMA", "hot", None, 25)
+        .await
+        .unwrap();
+    assert_eq!(res.count, 3);
+    assert_eq!(
+        h.counter.load(Ordering::SeqCst),
+        2,
+        "exactly two HTTP calls (429 + retry)"
+    );
+}
+
+// 429 then 429 -> RateLimited after two calls.
+#[tokio::test]
+async fn http_429_twice_is_rate_limited() {
+    let h = make_client(
+        1,
+        8,
+        vec![
+            FetchResponse {
+                status: 429,
+                content_type: String::new(),
+                body: Vec::new(),
+                etag: None,
+                last_modified: None,
+                retry_after: Some(1),
+            },
+            FetchResponse {
+                status: 429,
+                content_type: String::new(),
+                body: Vec::new(),
+                etag: None,
+                last_modified: None,
+                retry_after: None,
+            },
+        ],
+    );
+    let err = h
+        .client
+        .browse_subreddit("LocalLLaMA", "hot", None, 25)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, FetchError::RateLimited));
+    assert_eq!(
+        h.counter.load(Ordering::SeqCst),
+        2,
+        "exactly two HTTP calls, no more retries"
+    );
+}
+
+// 429 with Retry-After: 0 -> no sleep, still retries once.
+#[tokio::test]
+async fn http_429_retry_after_zero_retries_immediately() {
+    let body = std::fs::read_to_string("tests/fixtures/subreddit.atom").unwrap();
+    let h = make_client(
+        1,
+        8,
+        vec![
+            FetchResponse {
+                status: 429,
+                content_type: String::new(),
+                body: Vec::new(),
+                etag: None,
+                last_modified: None,
+                retry_after: Some(0),
+            },
+            FakeHttp::atom(&body),
+        ],
+    );
+    let res = h
+        .client
+        .browse_subreddit("LocalLLaMA", "hot", None, 25)
+        .await
+        .unwrap();
+    assert_eq!(res.count, 3);
+    assert_eq!(h.counter.load(Ordering::SeqCst), 2);
 }
 
 // Extra: 500 -> Http(500).
