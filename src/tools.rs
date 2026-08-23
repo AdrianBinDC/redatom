@@ -135,9 +135,9 @@ pub fn tool_err_text(e: &crate::error::FetchError) -> String {
 }
 
 fn tool_error(e: &crate::error::FetchError) -> Result<CallToolResult, ErrorData> {
-    Ok(CallToolResult::error(vec![rmcp::model::ContentBlock::text(
-        tool_err_text(e),
-    )]))
+    Ok(CallToolResult::error(vec![
+        rmcp::model::ContentBlock::text(tool_err_text(e)),
+    ]))
 }
 
 pub struct ToolServer {
@@ -203,7 +203,7 @@ impl ToolServer {
             .await
         {
             Ok(result) => ok_json(&result),
-            Err(e) => Err(ErrorData::internal_error(e.to_string(), None)),
+            Err(e) => tool_error(&e),
         }
     }
 
@@ -224,7 +224,40 @@ impl ToolServer {
             .await
         {
             Ok(result) => ok_json(&result),
-            Err(e) => Err(ErrorData::internal_error(e.to_string(), None)),
+            Err(e) => tool_error(&e),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::FetchError;
+
+    #[test]
+    fn tool_err_text_includes_variant_and_display() {
+        let e = FetchError::Blocked;
+        let text = tool_err_text(&e);
+        assert!(
+            text.starts_with("Blocked:"),
+            "expected variant name prefix, got {text:?}"
+        );
+        assert!(
+            text.contains("403"),
+            "expected display in message, got {text:?}"
+        );
+    }
+
+    #[test]
+    fn tool_err_text_rate_limited() {
+        let text = tool_err_text(&FetchError::RateLimited);
+        assert!(text.starts_with("RateLimited:"));
+    }
+
+    #[test]
+    fn tool_err_text_forbidden_host() {
+        let text = tool_err_text(&FetchError::ForbiddenHost("evil.example.com".into()));
+        assert!(text.starts_with("ForbiddenHost:"));
+        assert!(text.contains("evil.example.com"));
     }
 }
