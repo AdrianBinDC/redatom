@@ -25,4 +25,5 @@ url = "2"
 axum = "0.8.9"
 
 [dev-dependencies]
-wiremock = "0.6"
+http = "1"
+tower = "0.5"

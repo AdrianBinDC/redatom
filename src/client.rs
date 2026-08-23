@@ -789,6 +789,20 @@ fn is_submission_entry(entry: &Entry) -> bool {
     })
 }
 
+/// No-op HTTP backend for router tests that never reach the network.
+#[derive(Debug, Clone, Default)]
+pub struct NoopHttp;
+
+impl FeedHttp for NoopHttp {
+    fn get<'a>(
+        &'a self,
+        _url: &'a str,
+        _headers: &'a HeaderMap,
+    ) -> BoxFuture<'a, Result<FetchResponse, Box<dyn std::error::Error + Send + Sync>>> {
+        Box::pin(async { Err(std::io::Error::other("network disabled in tests").into()) })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
