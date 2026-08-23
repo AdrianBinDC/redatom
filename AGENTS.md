@@ -15,21 +15,21 @@ Context7 MCP is configured. **Before writing or changing code that uses a crate*
 
 ## Overnight issue queue (required)
 
-Qwen (and other unattended agents) should close **all** open GitHub issues on this repo without waiting for morning review.
+Close **all** open GitHub issues without waiting for morning review.
 
-1. `gh issue list --state open` and work through **every** open issue (currently #2–#8 style remediations; include any new ones that appear).
-2. **One git commit per issue.** Do not squash multiple issues into one commit. The commit message should reference the issue (e.g. `Fix FakeHttp response queue (#2).`).
-3. Preferred for morning review: **one branch** (e.g. `issues/overnight`) with N commits, then **one PR** that closes all of them (`Fixes #2` … in the PR body). If a later issue conflicts badly, a follow-up PR is OK; do not stall waiting for the operator.
-4. **Never push to `main`.** Do not merge unless the operator asked.
-5. After each issue’s commit, `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` must pass. Never leave a red commit in the stack. Never `--no-verify`.
-6. Independence: do not ask the operator; use `tmp/`; Context7; if truly blocked on one issue, skip it, `gh issue comment` with the blocker, continue the next issue.
+**One branch only:** `issues/overnight-08-23-2026`. **One PR** from that branch. **One commit per issue.** Do not open a branch or PR per issue.
+
+1. `git fetch origin && git checkout main && git pull && git checkout -b issues/overnight-08-23-2026` (if the branch already exists on origin, check it out and continue; do not create a second overnight branch).
+2. `gh issue list --state open` and work through **every** open issue (including new ones).
+3. **One git commit per issue.** Do not squash issues together. Message cites the issue, e.g. `Fix FakeHttp response queue (#2).`
+4. After each commit: `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` must pass. Never `--no-verify`. Never leave a red commit.
+5. Push the **same** branch (`git push -u origin issues/overnight-08-23-2026`). Open **one** PR targeting `main` whose body lists `Fixes #N` for every issue in the stack. If the PR already exists, push more commits onto it; do not open another PR.
+6. **Never push to `main`.** Do not merge unless the operator asked.
+7. If one issue is blocked: `gh issue comment` with the blocker, skip it, continue. Do not stall.
 
 ## Git (required)
 
-**Never push to `main`.** Every change is a branch + pull request.
-
-- Overnight issue work: follow **Overnight issue queue** above (one branch, one commit per issue, one PR preferred).
-- Other work (docs-only, tooling): `git checkout -b` a descriptive branch, then `git push -u origin HEAD` and `gh pr create` with a short summary. Do not merge unless the operator asked.
+**Never push to `main`.** Unattended work uses **`issues/overnight-08-23-2026` only** (see above). Do not use `issue/<n>-…` branches or one-PR-per-issue.
 
 Before every commit: `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, and `cargo test`. Never `--no-verify`.
 
