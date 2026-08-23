@@ -153,6 +153,8 @@ pub struct RedatomClient {
     cache: Mutex<LruCache<String, CacheEntry>>,
     ua: Ua,
     limiter_wait_secs: u64,
+    /// Whether the one-time UA fallback has already been used.
+    ua_fallback_used: std::sync::atomic::AtomicBool,
 }
 
 impl RedatomClient {
@@ -162,12 +164,29 @@ impl RedatomClient {
 
     /// Same as [`RedatomClient::new`] but with an explicit max limiter wait
     /// (seconds). Exposed for tests.
-    #[allow(dead_code)]
     pub fn with_wait(
         http: Arc<dyn FeedHttp>,
         min_interval_ms: u64,
         cache_cap: usize,
         limiter_wait_secs: u64,
+    ) -> Self {
+        Self::with_ua_and_wait(
+            http,
+            min_interval_ms,
+            cache_cap,
+            limiter_wait_secs,
+            Ua::Honest,
+        )
+    }
+
+    /// Same as [`RedatomClient::with_wait`] but with an explicit primary UA.
+    /// Exposed for tests of the 403 UA fallback.
+    pub fn with_ua_and_wait(
+        http: Arc<dyn FeedHttp>,
+        min_interval_ms: u64,
+        cache_cap: usize,
+        limiter_wait_secs: u64,
+        ua: Ua,
     ) -> Self {
         let period = Duration::from_millis(min_interval_ms.max(1));
         let quota = Quota::with_period(period)
@@ -180,8 +199,9 @@ impl RedatomClient {
             limiter: DefaultDirectRateLimiter::new(quota, Default::default(), Default::default()),
             in_flight: Arc::new(Semaphore::new(1)),
             cache: Mutex::new(LruCache::new(cap)),
-            ua: Ua::from_env(),
+            ua,
             limiter_wait_secs,
+            ua_fallback_used: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -290,11 +310,9 @@ impl RedatomClient {
 
         let headers = self.make_headers(url);
         let resp = self.http.get(url, &headers).await.map_err(map_http_error)?;
+        drop(_in_flight);
 
         if resp.status == 429 {
-            // Release the in-flight permit before retrying so we don't
-            // deadlock on the 1-permit semaphore.
-            drop(_in_flight);
             if let Some(wait) = resp.retry_after {
                 let capped = wait.min(60);
                 if capped > 0 {
@@ -316,18 +334,18 @@ impl RedatomClient {
                     .map_err(map_http_error)?;
                 drop(_in_flight2);
                 if resp2.status != 429 {
-                    return self.finish_fetch(url, resp2);
+                    return self.finish_fetch(url, resp2).await;
                 }
             }
             error!("HTTP 429 from reddit");
             return Err(FetchError::RateLimited);
         }
 
-        self.finish_fetch(url, resp)
+        self.finish_fetch(url, resp).await
     }
 
     /// Handle a received response: 304 cache hit, error status, or parse + cache.
-    fn finish_fetch(&self, url: &str, resp: FetchResponse) -> Result<Feed, FetchError> {
+    async fn finish_fetch(&self, url: &str, resp: FetchResponse) -> Result<Feed, FetchError> {
         let status = resp.status;
 
         match status {
@@ -345,8 +363,8 @@ impl RedatomClient {
                 }
             }
             403 => {
-                error!("HTTP 403 (WAF) from reddit");
-                Err(FetchError::Blocked)
+                error!("HTTP 403 (WAF) from reddit; trying one UA fallback");
+                return self.retry_with_fallback_ua(url).await;
             }
             s if !(200..300).contains(&s) => {
                 error!(status = s, "HTTP error");
@@ -354,6 +372,66 @@ impl RedatomClient {
             }
             _ => self.parse_and_cache(url, resp),
         }
+    }
+
+    /// On HTTP 403, try one different User-Agent for the same URL.
+    /// If that also fails or returns 403/HTML, return `Blocked`.
+    /// If it succeeds with 200 Atom, the fallback UA becomes sticky.
+    async fn retry_with_fallback_ua(&self, url: &str) -> Result<Feed, FetchError> {
+        let ua_fallback = match self.ua_fallback_used.compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        ) {
+            Ok(_) => self.ua.fallback(),
+            Err(_) => {
+                error!("UA fallback already used this process; returning Blocked");
+                return Err(FetchError::Blocked);
+            }
+        };
+
+        let fallback_ua = match ua_fallback {
+            Some(f) => f,
+            None => {
+                error!(
+                    "no UA fallback available from primary UA {:?}; returning Blocked",
+                    self.ua
+                );
+                return Err(FetchError::Blocked);
+            }
+        };
+
+        info!(?self.ua, ?fallback_ua, "retrying with fallback UA");
+
+        // Re-acquire limiter + in-flight semaphore for the second attempt.
+        self.acquire_permit(self.limiter_wait_secs).await?;
+        let _in_flight = self
+            .in_flight
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("semaphore not closed");
+
+        let mut headers = self.make_headers(url);
+        let ua_value = HeaderValue::from_str(&fallback_ua.header()).expect("fallback UA is valid");
+        headers.insert(USER_AGENT, ua_value);
+
+        let resp = self.http.get(url, &headers).await.map_err(map_http_error)?;
+
+        drop(_in_flight);
+
+        if resp.status == 403 {
+            error!("fallback UA also returned 403; returning Blocked");
+            return Err(FetchError::Blocked);
+        }
+
+        // 200 success: make the fallback UA sticky for the rest of the process.
+        if (200..300).contains(&resp.status) {
+            info!("fallback UA succeeded; making it sticky for the rest of the process");
+        }
+
+        self.parse_and_cache(url, resp)
     }
 
     /// Browse a subreddit listing surface.
