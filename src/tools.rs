@@ -5,7 +5,7 @@ use std::sync::Arc;
 use rmcp::ErrorData;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
-use rmcp::{tool, tool_router};
+use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -156,7 +156,7 @@ pub fn tool_err_text(e: &crate::error::FetchError) -> String {
         crate::error::FetchError::InvalidUrl(_) => "InvalidUrl",
         crate::error::FetchError::ForbiddenHost(_) => "ForbiddenHost",
         crate::error::FetchError::Blocked => "Blocked",
-        crate::error::FetchError::RateLimited => "RateLimited",
+        crate::error::FetchError::RateLimited { .. } => "RateLimited",
         crate::error::FetchError::Http(_) => "Http",
         crate::error::FetchError::NotAtom => "NotAtom",
         crate::error::FetchError::Timeout => "Timeout",
@@ -190,7 +190,7 @@ impl ToolServer {
     }
 }
 
-#[tool_router(server_handler)]
+#[tool_router]
 impl ToolServer {
     /// Fetch a Reddit subreddit listing via public Atom/RSS.
     /// RSS only: no scores, no comment trees, ~25 items max, no API key.
@@ -281,11 +281,30 @@ impl ToolServer {
     }
 }
 
+#[tool_handler(
+    name = "reddit-rss-mcp",
+    instructions = "Reddit tools are browse_subreddit, search_reddit, get_post_comments (MCP names; some clients prefix mcp__redatom__). There is no redatom skill and no search_suggestions tool. If a direct call says the tool does not exist, tool_describe that name then tool_call. Do not cargo build, curl /mcp, or read a git repo to fetch Reddit."
+)]
+impl ServerHandler for ToolServer {}
+
 #[cfg(test)]
 #[allow(missing_docs, clippy::missing_docs_in_private_items)]
 mod tests {
     use super::*;
+    use crate::client::{NoopHttp, RedatomClient};
     use crate::error::FetchError;
+
+    #[test]
+    fn server_info_names_the_three_tools() {
+        let server = ToolServer::new(Arc::new(RedatomClient::new(Arc::new(NoopHttp), 0, 8)));
+        let info = server.get_info();
+        let text = info.instructions.expect("initialize instructions");
+        assert!(text.contains("browse_subreddit"));
+        assert!(text.contains("search_reddit"));
+        assert!(text.contains("get_post_comments"));
+        assert!(info.capabilities.tools.is_some());
+        assert_eq!(info.server_info.name, "reddit-rss-mcp");
+    }
 
     #[test]
     fn tool_err_text_includes_variant_and_display() {
@@ -303,8 +322,19 @@ mod tests {
 
     #[test]
     fn tool_err_text_rate_limited() {
-        let text = tool_err_text(&FetchError::RateLimited);
+        let text = tool_err_text(&FetchError::RateLimited {
+            retry_after_secs: None,
+        });
         assert!(text.starts_with("RateLimited:"));
+    }
+
+    #[test]
+    fn tool_err_text_rate_limited_includes_retry_after() {
+        let text = tool_err_text(&FetchError::RateLimited {
+            retry_after_secs: Some(48),
+        });
+        assert!(text.starts_with("RateLimited:"));
+        assert!(text.contains("retry after 48s"), "got {text:?}");
     }
 
     #[test]

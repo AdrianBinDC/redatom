@@ -1,0 +1,10 @@
+.git
+target
+tmp
+**/*.md
+!README.md
+LICENSE
+tests
+.github
+.gitignore
+.dockerignore

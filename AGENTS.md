@@ -11,6 +11,8 @@ Follow `SPEC.md`. Do not wait for the operator. Do not ask clarifying questions.
 
 ## Docs (required)
 
+How to run it (stdio vs HTTP, Docker, clients, env): `SETUP.md`. Do not invent a second setup story in the README.
+
 Context7 MCP is configured. **Before writing or changing code that uses a crate**, look up that crate’s API in Context7 for the **version in `Cargo.lock`** (or `Cargo.toml` if unlocked). Do not guess `governor`, `rmcp`, `lru`, `reqwest`, `feed-rs`, `axum`, or `clap` signatures. Do not wander GitHub/random blogs when Context7 has the docs. Crate source under `~/.cargo/registry` is an acceptable backup if it matches the locked version.
 
 ## Overnight issue queue (required)

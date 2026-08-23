@@ -146,7 +146,7 @@ Never flatten into empty posts.
 | `InvalidUrl` | comments URL missing/unparseable |
 | `ForbiddenHost` | comments host not allowlisted |
 | `Blocked` | HTTP 403, or 200 body that is not Atom |
-| `RateLimited` | HTTP 429 (`Retry-After` if present) |
+| `RateLimited` | HTTP 429, local limiter wait exhausted, or Reddit `x-ratelimit-remaining` is 0 for longer than the wait budget. Message includes `retry after Ns` when `Retry-After` or `x-ratelimit-reset` is known. |
 | `Http(status)` | other 4xx/5xx |
 | `NotAtom` | 2xx but body is not an Atom feed |
 | `Timeout` | connect/total timeout |
@@ -184,7 +184,8 @@ Behavior:
 - Acquire a `governor` permit **before** every outbound Reddit GET (including ETag revalidation). `/health` never acquires and never fetches.
 - `Quota::with_period(Duration::from_millis(min_interval)).allow_burst(NonZeroU32::MIN)` (burst 1). Pair with a semaphore of 1 so overlapping tool calls cannot stampede.
 - If a permit is not available immediately: **wait** up to `REDDIT_RSS_LIMITER_WAIT_SECS` (default 30). If still none → `RateLimited` (do not queue unbounded Hermes/cron calls).
-- HTTP 429: honor `Retry-After` **once** (still through the limiter), then `RateLimited`. Do not tight-loop.
+- HTTP 429: honor `Retry-After` or `x-ratelimit-reset` **once** when the wait is shorter than `REDDIT_RSS_LIMITER_WAIT_SECS` (sleep capped at 60s). If the wait is zero, missing, or ≥ the limiter budget, return `RateLimited` immediately with a positive `retry_after_secs` when known. Do not report `retry_after_secs: 0`. Do not tight-loop.
+- Parse `x-ratelimit-remaining` and `x-ratelimit-reset` on every Reddit response. When remaining is 0, hold further GETs until reset (capped at 300s). Wait out that hold up to `REDDIT_RSS_QUOTA_WAIT_SECS` (default **90**). This budget is **not** `LIMITER_WAIT_SECS`: RSS reset is often 31–60s, which used to fail every sibling MCP call instantly. If the hold exceeds `QUOTA_WAIT_SECS`, fail immediately with `RateLimited { retry_after_secs }`. The governor wait clock starts after the hold sleep. Semaphore of 1 still serializes the drain.
 - HTTP 403 / `Blocked` / `NotAtom`: **no retry storm**. At most one UA fallback, then fail. `tracing::error!` with the variant.
 - Do not add jittered UA rotation, parallel prefetch, or background polling. Callers that want many subs must space ticks; this process will not fire N feeds at once.
 
@@ -237,6 +238,7 @@ Use `rmcp` (MCP 2025-11-25). Do not hand-roll NDJSON.
 **HTTP:** `reddit-rss-mcp --http --bind 0.0.0.0:8085`
 
 - `POST /mcp` Streamable HTTP
+- MCP `initialize` includes `instructions` naming the three tools (no extra help tool, no HTTP help route)
 - `GET /health` → `{"ok":true}` — liveness only, never call Reddit
 - If bind is not loopback, require `Authorization: Bearer <token>` (`REDDIT_RSS_MCP_KEY`). Missing/wrong → 401. Exit non-zero if `--http` binds non-loopback and key is empty.
 - Default bind: `127.0.0.1:8085`
@@ -251,7 +253,8 @@ Use `rmcp` (MCP 2025-11-25). Do not hand-roll NDJSON.
 | `REDDIT_RSS_MCP_KEY` | bearer (required for non-loopback HTTP) |
 | `REDDIT_RSS_UA` | User-Agent override |
 | `REDDIT_RSS_MIN_INTERVAL_MS` | default `2000` |
-| `REDDIT_RSS_LIMITER_WAIT_SECS` | max wait for a permit; default `30` |
+| `REDDIT_RSS_LIMITER_WAIT_SECS` | max wait for a governor permit; default `30` |
+| `REDDIT_RSS_QUOTA_WAIT_SECS` | max wait for Reddit `remaining=0` reset; default `90` |
 | `REDDIT_RSS_TIMEOUT_SECS` | default `20` |
 | `REDDIT_RSS_CACHE_CAP` | LRU entries; default `256` |
 | `RUST_LOG` | `tracing` filter; default `reddit_rss_mcp=info` |

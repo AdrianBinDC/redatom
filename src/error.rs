@@ -26,8 +26,14 @@ pub enum FetchError {
     Blocked,
 
     /// HTTP 429, or the process-wide limiter wait budget was exhausted.
-    #[error("rate limited by Reddit (HTTP 429)")]
-    RateLimited,
+    ///
+    /// `retry_after_secs` is Reddit's wait hint when known (`Retry-After` or
+    /// `x-ratelimit-reset`).
+    #[error("{}", rate_limited_msg(retry_after_secs))]
+    RateLimited {
+        /// Seconds until Reddit's quota resets, when known.
+        retry_after_secs: Option<u64>,
+    },
 
     /// Other HTTP 4xx/5xx.
     #[error("HTTP {0}")]
@@ -48,4 +54,12 @@ pub enum FetchError {
     /// Atom well-formedness / `feed-rs` parse failure.
     #[error("failed to parse Atom feed: {0}")]
     Parse(String),
+}
+
+/// Display text for [`FetchError::RateLimited`].
+fn rate_limited_msg(retry_after_secs: &Option<u64>) -> String {
+    match retry_after_secs {
+        Some(s) => format!("rate limited by Reddit (HTTP 429); retry after {s}s"),
+        None => "rate limited by Reddit (HTTP 429)".to_string(),
+    }
 }
