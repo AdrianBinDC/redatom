@@ -1,0 +1,49 @@
+# Runs on every push/PR. Cargo steps are skipped until a crate exists.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect crate
+        id: crate
+        run: |
+          if [ -f Cargo.toml ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: No crate yet
+        if: steps.crate.outputs.present == 'false'
+        run: echo "No Cargo.toml; skipping fmt/clippy/test. SPEC-only repo is OK."
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.crate.outputs.present == 'true'
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        if: steps.crate.outputs.present == 'true'
+
+      - name: cargo fmt
+        if: steps.crate.outputs.present == 'true'
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        if: steps.crate.outputs.present == 'true'
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test
+        if: steps.crate.outputs.present == 'true'
+        run: cargo test
