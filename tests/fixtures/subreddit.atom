@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/">
+  <id>https://www.reddit.com/r/LocalLLaMA/.rss</id>
+  <title>LocalLLaMA</title>
+  <updated>2026-08-22T12:00:00+00:00</updated>
+  <link rel="self" href="https://www.reddit.com/r/LocalLLaMA/hot.rss?limit=25"/>
+  <link rel="alternate" href="https://www.reddit.com/r/LocalLLaMA/"/>
+  <opensearch:totalResults>25</opensearch:totalResults>
+  <opensearch:itemsPerPage>25</opensearch:itemsPerPage>
+  <opensearch:startIndex>0</opensearch:startIndex>
+  <entry>
+    <id>t3_1vv0000</id>
+    <updated>2026-08-22T10:00:00+00:00</updated>
+    <published>2026-08-22T09:55:00+00:00</published>
+    <title>Hot post about LLMs</title>
+    <author><name>/u/llm_fan</name><uri>https://www.reddit.com/user/llm_fan</uri></author>
+    <link rel="alternate" type="text/html" href="https://www.reddit.com/r/LocalLLaMA/comments/1vv0000/hot_post_about_llms/"/>
+    <category term="LocalLLaMA" label="r/LocalLLaMA"/>
+    <content type="html">&lt;div class="md"&gt;&lt;p&gt;This is a hot post about LLMs. &amp;#39;Hello world&amp;#39; says the model.&lt;/p&gt;&lt;/div&gt;</content>
+  </entry>
+  <entry>
+    <id>t3_1vv0001</id>
+    <updated>2026-08-22T09:00:00+00:00</updated>
+    <published>2026-08-22T08:50:00+00:00</published>
+    <title>New model released</title>
+    <author><name>/u/releasebot</name><uri>https://www.reddit.com/user/releasebot</uri></author>
+    <link rel="alternate" type="text/html" href="https://www.reddit.com/r/LocalLLaMA/comments/1vv0001/new_model_released/"/>
+    <category term="LocalLLaMA" label="r/LocalLLaMA"/>
+    <content type="html">&lt;div class="md"&gt;&lt;p&gt;A brand new open model is here!&lt;/p&gt;&lt;/div&gt;</content>
+  </entry>
+  <entry>
+    <id>t3_1vv0002</id>
+    <updated>2026-08-22T08:00:00+00:00</updated>
+    <published>2026-08-22T07:45:00+00:00</published>
+    <title>Question about quantization</title>
+    <author><name>/u/newbie</name><uri>https://www.reddit.com/user/newbie</uri></author>
+    <link rel="alternate" type="text/html" href="https://www.reddit.com/r/LocalLLaMA/comments/1vv0002/question_about_quantization/"/>
+    <category term="LocalLLaMA" label="r/LocalLLaMA"/>
+    <content type="html">&lt;div class="md"&gt;&lt;p&gt;How do I quantize without losing quality?&lt;/p&gt;&lt;/div&gt;</content>
+  </entry>
+</feed>
